@@ -138,7 +138,7 @@ function escapeCsvField(value) {
  * @param {Map<string, string>} originalUrlsMap - Map of normalized -> original URLs
  * @param {string} csvFilePath - Path to the CSV file
  */
-async function exportCrawlResultsToCsv(normalizedUrls, originalUrlsMap, csvFilePath) {
+async function exportCrawlResultsToCsv(normalizedUrls, originalUrlsMap, csvFilePath, jobId) {
   try {
     // Convert normalized URLs to original URLs, preserving www. if present
     const originalUrls = Array.from(normalizedUrls)
@@ -163,9 +163,9 @@ async function exportCrawlResultsToCsv(normalizedUrls, originalUrlsMap, csvFileP
     }
     
     fs.writeFileSync(csvFilePath, content, 'utf8');
-    console.log(`✓ Exported ${sortedUrls.length} unique URLs to ${csvFilePath}`);
+    console.log(`[CRAWL COMPLETION] Job ${jobId} - ✓ Exported ${originalUrls.length} unique URLs to ${csvFilePath}`);
   } catch (error) {
-    console.error(`Error exporting crawl results to CSV: ${error.message}`);
+    console.error(`[ERROR] Job ${jobId} - Error exporting crawl results to CSV: ${error.message}`);
     // Don't throw - allow crawl to complete even if CSV export fails
   }
 }
@@ -189,6 +189,11 @@ async function updateJobStatus(jobId, status, metadata = {}) {
     updateData.failed_at = new Date().toISOString();
   }
 
+  // Always update last_activity_at when status is 'running'
+  if (status === 'running') {
+    updateData.last_activity_at = new Date().toISOString();
+  }
+
   const { error } = await supabase
     .from('crawl_jobs')
     .update(updateData)
@@ -207,21 +212,64 @@ async function runCrawl(job) {
   const domain = job.domain;
   const seedUrl = domain.startsWith('http') ? domain : `https://${domain}`;
   
-  console.log(`[CRAWL STARTED] Job ${job.id} - Domain: ${domain}`);
-  console.log(`[CRAWL STARTED] Seed URL: ${seedUrl}`);
+  console.log(`[CRAWL START] Job ${job.id} - Starting crawl for domain: ${domain}`);
+  console.log(`[CRAWL START] Job ${job.id} - Seed URL: ${seedUrl}`);
+  console.log(`[CRAWL START] Job ${job.id} - Max pages: ${MAX_PAGES}, Max depth: ${MAX_DEPTH}`);
 
-  // Initialize BFS queue
+  // Initialize BFS queue and data structures first
   const queue = [{ url: seedUrl, depth: 0 }];
   const seenUrls = new Set(); // URLs that have been enqueued (normalized)
   const visitedNormalizedUrls = new Set(); // URLs that have been crawled (normalized) - global deduplication
   const originalUrlsMap = new Map(); // Maps normalized URL -> original URL (for CSV export)
   
-  // Crawl statistics
+  // Crawl statistics - declare before timeout/stall detection
   let pagesCrawled = 0;
   let totalUrlsDiscovered = 0;
   let totalUrlsEnqueued = 0;
   let totalDuplicatesSkipped = 0;
   let maxDepthReached = 0;
+
+  // Timeout and stall detection
+  const MAX_RUNTIME_MS = 15 * 60 * 1000; // 15 minutes
+  const STALL_DETECTION_MS = 2 * 60 * 1000; // 2 minutes
+  const crawlStartTime = Date.now();
+  let lastActivityTime = Date.now();
+  let timeoutId = null;
+  let stallCheckInterval = null;
+
+  // Set hard timeout (15 minutes)
+  timeoutId = setTimeout(async () => {
+    console.error(`[CRAWL FAILED] Job ${job.id} - Timeout: Exceeded 15 minute runtime limit`);
+    if (stallCheckInterval) clearInterval(stallCheckInterval);
+    await updateJobStatus(job.id, 'failed', {
+      error_message: 'Crawl exceeded maximum runtime of 15 minutes',
+      stop_reason: 'timeout',
+      pages_discovered: visitedNormalizedUrls.size,
+      pages_crawled: pagesCrawled,
+      duplicates_skipped: totalDuplicatesSkipped
+    });
+    console.error(`[CRAWL FAILED] Job ${job.id} - Job marked as failed due to timeout`);
+    process.exit(1); // Force exit on timeout
+  }, MAX_RUNTIME_MS);
+
+  // Stall detection - check every 30 seconds
+  stallCheckInterval = setInterval(async () => {
+    const timeSinceLastActivity = Date.now() - lastActivityTime;
+    if (timeSinceLastActivity > STALL_DETECTION_MS) {
+      console.error(`[CRAWL FAILED] Job ${job.id} - Stalled: No activity for ${Math.round(timeSinceLastActivity / 1000)}s`);
+      clearInterval(stallCheckInterval);
+      clearTimeout(timeoutId);
+      await updateJobStatus(job.id, 'failed', {
+        error_message: `Crawl stalled - no activity for ${Math.round(timeSinceLastActivity / 1000)} seconds`,
+        stop_reason: 'stalled',
+        pages_discovered: visitedNormalizedUrls.size,
+        pages_crawled: pagesCrawled,
+        duplicates_skipped: totalDuplicatesSkipped
+      });
+      console.error(`[CRAWL FAILED] Job ${job.id} - Job marked as failed due to stall`);
+      process.exit(1);
+    }
+  }, 30000); // Check every 30 seconds
 
   // Load already crawled URLs from Supabase for this job
   const { data: existingPages } = await supabase
@@ -240,7 +288,7 @@ async function runCrawl(job) {
         originalUrlsMap.set(page.normalized_url, originalUrl);
       }
     });
-    console.log(`Found ${existingPages.length} existing pages for this job`);
+    console.log(`[CRAWL START] Job ${job.id} - Found ${existingPages.length} existing pages for this job`);
   }
 
   // Normalize and add seed URL to seenUrls (it's been enqueued)
@@ -261,11 +309,11 @@ async function runCrawl(job) {
       seedHostname = seedHostname.substring(4);
     }
   } catch (error) {
-    console.error(`Invalid seed URL: ${seedUrl}`);
-    await supabase
-      .from('crawl_jobs')
-      .update({ status: 'failed' })
-      .eq('id', job.id);
+    console.error(`[CRAWL FAILED] Job ${job.id} - Invalid seed URL: ${seedUrl}`);
+    await updateJobStatus(job.id, 'failed', {
+      error_message: `Invalid seed URL: ${seedUrl}`,
+      stop_reason: 'invalid_seed_url'
+    });
     return;
   }
 
@@ -275,27 +323,27 @@ async function runCrawl(job) {
 
     // Skip if depth exceeds limit
     if (depth > MAX_DEPTH) {
-      console.log(`[SKIP] ${absoluteUrl || currentUrl} - skipped due to depth (${depth} > ${MAX_DEPTH})`);
+      console.log(`[SKIP] Job ${job.id} - ${absoluteUrl || currentUrl} - skipped due to depth (${depth} > ${MAX_DEPTH})`);
       continue;
     }
 
     // Resolve relative URLs to absolute
     const absoluteUrl = resolveUrl(currentUrl, seedUrl);
     if (!absoluteUrl) {
-      console.log(`Skipping invalid URL: ${currentUrl}`);
+      console.log(`[SKIP] Job ${job.id} - Skipping invalid URL: ${currentUrl}`);
       continue;
     }
 
     // Normalize the URL
     const normalizedUrl = normalizeUrl(absoluteUrl);
     if (!normalizedUrl) {
-      console.log(`Skipping URL that failed normalization: ${absoluteUrl}`);
+      console.log(`[SKIP] Job ${job.id} - Skipping URL that failed normalization: ${absoluteUrl}`);
       continue;
     }
 
     // Skip if already crawled (shouldn't happen if deduplication works, but safety check)
     if (visitedNormalizedUrls.has(normalizedUrl)) {
-      console.log(`[SKIP] ${absoluteUrl} - skipped due to duplicate normalized URL (already crawled): ${normalizedUrl}`);
+      console.log(`[SKIP] Job ${job.id} - ${absoluteUrl} - skipped due to duplicate normalized URL (already crawled): ${normalizedUrl}`);
       totalDuplicatesSkipped++;
       continue;
     }
@@ -303,7 +351,7 @@ async function runCrawl(job) {
     // Check if URL should be skipped (protocol, extension, etc.)
     const skipCheck = shouldSkipUrl(absoluteUrl);
     if (skipCheck.skip) {
-      console.log(`[SKIP] ${absoluteUrl} - skipped due to ${skipCheck.reason}`);
+      console.log(`[SKIP] Job ${job.id} - ${absoluteUrl} - skipped due to ${skipCheck.reason}`);
       continue;
     }
 
@@ -316,11 +364,11 @@ async function runCrawl(job) {
       }
       // seedHostname is already normalized (www. removed)
       if (urlHostname !== seedHostname && !urlHostname.endsWith('.' + seedHostname)) {
-        console.log(`[SKIP] ${absoluteUrl} - skipped due to external domain (${urlHostname} vs ${seedHostname})`);
+        console.log(`[SKIP] Job ${job.id} - ${absoluteUrl} - skipped due to external domain (${urlHostname} vs ${seedHostname})`);
         continue; // Skip external URLs
       }
     } catch (error) {
-      console.log(`[SKIP] ${absoluteUrl} - skipped due to invalid URL format`);
+      console.log(`[SKIP] Job ${job.id} - ${absoluteUrl} - skipped due to invalid URL format`);
       continue; // Skip invalid URLs
     }
 
@@ -333,15 +381,30 @@ async function runCrawl(job) {
       maxDepthReached = depth;
     }
 
+    // Update last activity time
+    lastActivityTime = Date.now();
+
     try {
-      console.log(`Crawling [${pagesCrawled}/${MAX_PAGES}] depth ${depth}: ${absoluteUrl}`);
+      // Log progress with metrics
+      console.log(`[PROGRESS] Job ${job.id} - Crawling page ${pagesCrawled}/${MAX_PAGES} (depth ${depth}): ${absoluteUrl}`);
+      console.log(`[PROGRESS] Discovered: ${visitedNormalizedUrls.size} | Crawled: ${pagesCrawled} | Duplicates skipped: ${totalDuplicatesSkipped}`);
+      
+      // Update job progress in database (non-blocking)
+      updateJobStatus(job.id, 'running', {
+        pages_discovered: visitedNormalizedUrls.size,
+        pages_crawled: pagesCrawled,
+        duplicates_skipped: totalDuplicatesSkipped,
+        last_activity_at: new Date().toISOString()
+      }).catch(err => {
+        console.error(`[WARNING] Job ${job.id} - Failed to update job progress:`, err.message);
+      });
 
       // Fetch the page
       const fetchResult = await fetchPage(absoluteUrl);
 
       // Skip if not HTML
       if (!fetchResult.html) {
-        console.log(`Skipping non-HTML: ${absoluteUrl}`);
+        console.log(`[SKIP] Job ${job.id} - Skipping non-HTML: ${absoluteUrl}`);
         continue;
       }
 
@@ -372,15 +435,15 @@ async function runCrawl(job) {
         });
 
       if (insertError) {
-        console.error(`Error storing page ${pageData.url}:`, insertError);
+        console.error(`[ERROR] Job ${job.id} - Error storing page ${pageData.url}:`, insertError);
       } else {
-        console.log(`✓ Stored page: ${normalizedUrl}`);
+        console.log(`[PROGRESS] Job ${job.id} - ✓ Stored page: ${normalizedUrl}`);
       }
 
       // Extract links from the page
       const links = extractLinks(fetchResult.html);
       totalUrlsDiscovered += links.length;
-      console.log(`Found ${links.length} links on ${absoluteUrl}`);
+      console.log(`[PROGRESS] Job ${job.id} - Found ${links.length} links on ${absoluteUrl}`);
 
       // Process and enqueue new links
       let enqueuedCount = 0;
@@ -433,7 +496,7 @@ async function runCrawl(job) {
 
         // Check if already seen (enqueued) or visited (crawled) - deduplication check
         if (seenUrls.has(normalizedLink)) {
-          console.log(`[SKIP] ${resolvedLink} - skipped due to duplicate normalized URL (already enqueued or crawled): ${normalizedLink}`);
+          console.log(`[SKIP] Job ${job.id} - ${resolvedLink} - skipped due to duplicate normalized URL (already enqueued or crawled): ${normalizedLink}`);
           skippedCount++;
           duplicatesSkipped++;
           continue;
@@ -455,19 +518,26 @@ async function runCrawl(job) {
       }
 
       totalDuplicatesSkipped += duplicatesSkipped;
-      console.log(`Enqueued ${enqueuedCount} new links, skipped ${skippedCount} links (${duplicatesSkipped} duplicates) from ${absoluteUrl}`);
+      console.log(`[PROGRESS] Job ${job.id} - Enqueued ${enqueuedCount} new links, skipped ${skippedCount} links (${duplicatesSkipped} duplicates) from ${absoluteUrl}`);
 
     } catch (error) {
-      console.error(`Error processing ${absoluteUrl}:`, error.message);
+      console.error(`[ERROR] Job ${job.id} - Error processing ${absoluteUrl}:`, error.message);
       // Continue with next URL
       continue;
     }
   }
 
+  // Clear timeout and stall detection
+  if (timeoutId) clearTimeout(timeoutId);
+  if (stallCheckInterval) clearInterval(stallCheckInterval);
+
   // Determine stop reason
   const stopReason = pagesCrawled >= MAX_PAGES 
     ? `MAX_PAGES limit reached (${MAX_PAGES})` 
     : 'Queue exhausted';
+
+  console.log(`[CRAWL COMPLETION] Job ${job.id} - Crawl finished. Reason: ${stopReason}`);
+  console.log(`[CRAWL COMPLETION] Job ${job.id} - Final stats: ${pagesCrawled} pages crawled, ${visitedNormalizedUrls.size} unique URLs discovered, ${totalDuplicatesSkipped} duplicates skipped`);
 
   // Update crawl job status to "completed" with summary
   await updateJobStatus(job.id, 'completed', {
@@ -479,44 +549,32 @@ async function runCrawl(job) {
 
   // Export crawl results to CSV
   const csvFilePath = path.join(__dirname, '../crawl-results.csv');
-  await exportCrawlResultsToCsv(visitedNormalizedUrls, originalUrlsMap, csvFilePath);
+  console.log(`[CRAWL COMPLETION] Job ${job.id} - Exporting crawl results to CSV`);
+  await exportCrawlResultsToCsv(visitedNormalizedUrls, originalUrlsMap, csvFilePath, job.id);
 
   // Run comparison with ScreamingFrog URLs
-  console.log('\n' + '='.repeat(60));
-  console.log('COMPARING WITH SCREAMINGFROG');
-  console.log('='.repeat(60));
+  console.log(`[CRAWL COMPLETION] Job ${job.id} - Running comparison with ScreamingFrog URLs`);
   try {
     await compareUrls();
   } catch (error) {
-    console.error(`Warning: Comparison failed: ${error.message}`);
-    console.log('(This is non-fatal - crawl completed successfully)\n');
+    console.error(`[WARNING] Job ${job.id} - Comparison failed: ${error.message}`);
+    console.log(`[WARNING] Job ${job.id} - (This is non-fatal - crawl completed successfully)`);
   }
 
   // Output crawl summary
-  console.log('\n' + '='.repeat(60));
-  console.log('CRAWL SUMMARY');
-  console.log('='.repeat(60));
-  console.log(`Job ID: ${job.id}`);
-  console.log(`Domain: ${domain}`);
-  console.log(`Seed URL: ${seedUrl}`);
-  console.log('');
-  console.log('Statistics:');
-  console.log(`  Total pages discovered: ${seenUrls.size}`);
-  console.log(`  Total unique normalized URLs stored: ${visitedNormalizedUrls.size}`);
-  console.log(`  Total skipped as duplicates: ${totalDuplicatesSkipped}`);
-  console.log(`  Total pages crawled: ${pagesCrawled}`);
-  console.log(`  Total URLs discovered (raw links): ${totalUrlsDiscovered}`);
-  console.log(`  Total URLs enqueued: ${totalUrlsEnqueued}`);
-  console.log(`  Max depth reached: ${maxDepthReached}`);
-  console.log('');
-  console.log('Stop Reason:');
-  console.log(`  ${stopReason}`);
-  console.log('');
-  console.log('Limits:');
-  console.log(`  MAX_PAGES: ${MAX_PAGES}`);
-  console.log(`  MAX_DEPTH: ${MAX_DEPTH}`);
-  console.log('='.repeat(60) + '\n');
-  console.log(`[CRAWL COMPLETED] Job ${job.id} - ${pagesCrawled} pages crawled, ${visitedNormalizedUrls.size} unique URLs discovered`);
+  console.log(`[CRAWL COMPLETION] Job ${job.id} - Final Summary:`);
+  console.log(`[CRAWL COMPLETION] Job ${job.id} - Domain: ${domain}`);
+  console.log(`[CRAWL COMPLETION] Job ${job.id} - Seed URL: ${seedUrl}`);
+  console.log(`[CRAWL COMPLETION] Job ${job.id} - Total pages discovered: ${seenUrls.size}`);
+  console.log(`[CRAWL COMPLETION] Job ${job.id} - Total unique normalized URLs stored: ${visitedNormalizedUrls.size}`);
+  console.log(`[CRAWL COMPLETION] Job ${job.id} - Total skipped as duplicates: ${totalDuplicatesSkipped}`);
+  console.log(`[CRAWL COMPLETION] Job ${job.id} - Total pages crawled: ${pagesCrawled}`);
+  console.log(`[CRAWL COMPLETION] Job ${job.id} - Total URLs discovered (raw links): ${totalUrlsDiscovered}`);
+  console.log(`[CRAWL COMPLETION] Job ${job.id} - Total URLs enqueued: ${totalUrlsEnqueued}`);
+  console.log(`[CRAWL COMPLETION] Job ${job.id} - Max depth reached: ${maxDepthReached}`);
+  console.log(`[CRAWL COMPLETION] Job ${job.id} - Stop reason: ${stopReason}`);
+  console.log(`[CRAWL COMPLETED] Job ${job.id} - Successfully completed`);
+  console.log(`[CRAWL COMPLETED] Job ${job.id} - Final stats: ${pagesCrawled} pages crawled, ${visitedNormalizedUrls.size} unique URLs discovered, ${totalDuplicatesSkipped} duplicates skipped`);
 }
 
 /**
@@ -528,13 +586,17 @@ async function runCrawlWithErrorHandling(job) {
   try {
     await runCrawl(job);
   } catch (error) {
-    console.error(`[CRAWL FAILED] Job ${job.id}:`, error.message);
-    console.error(error.stack);
+    console.error(`[CRAWL FAILED] Job ${job.id} - Crawl failed with error: ${error.message}`);
+    console.error(`[CRAWL FAILED] Job ${job.id} - Stack trace:`, error.stack);
+    console.error(`[CRAWL FAILED] Job ${job.id} - Marking job as failed in database`);
     
-    // Update job status to failed
+    // Update job status to failed - ensure it always ends in completed or failed
     await updateJobStatus(job.id, 'failed', {
-      error_message: error.message
+      error_message: error.message,
+      stop_reason: 'error'
     });
+    
+    console.error(`[CRAWL FAILED] Job ${job.id} - Job status updated to failed`);
   }
 }
 
@@ -564,7 +626,7 @@ async function getJobStatus(jobId) {
     .select('*', { count: 'exact', head: true })
     .eq('crawl_job_id', jobId);
 
-  // Build response with summary
+  // Build response with summary - include all progress fields
   const response = {
     crawl_job_id: job.id,
     domain: job.domain,
@@ -573,9 +635,10 @@ async function getJobStatus(jobId) {
     started_at: job.started_at,
     completed_at: job.completed_at,
     failed_at: job.failed_at,
-    pages_discovered: job.pages_discovered || pageCount || 0,
-    pages_crawled: job.pages_crawled || null,
-    duplicates_skipped: job.duplicates_skipped || null,
+    last_activity_at: job.last_activity_at || null,
+    pages_discovered: job.pages_discovered !== null && job.pages_discovered !== undefined ? job.pages_discovered : (pageCount || 0),
+    pages_crawled: job.pages_crawled !== null && job.pages_crawled !== undefined ? job.pages_crawled : null,
+    duplicates_skipped: job.duplicates_skipped !== null && job.duplicates_skipped !== undefined ? job.duplicates_skipped : null,
     stop_reason: job.stop_reason || null,
     error_message: job.error_message || null
   };
