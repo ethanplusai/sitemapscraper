@@ -15,10 +15,11 @@ const { startCrawl, runCrawlWithErrorHandling, getJobStatus } = require('./crawl
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// CORS middleware - allow all origins with GET and POST methods
+// CORS middleware - MUST be first to handle OPTIONS preflight requests
+// Allows all origins for Base44 frontend integration
 app.use(cors({
   origin: '*',
-  methods: ['GET', 'POST'],
+  methods: ['GET', 'POST', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
   credentials: false
 }));
