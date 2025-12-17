@@ -9,10 +9,19 @@
 
 require('dotenv').config();
 const express = require('express');
+const cors = require('cors');
 const { startCrawl, runCrawlWithErrorHandling, getJobStatus } = require('./crawl');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+// CORS middleware - allow all origins with GET and POST methods
+app.use(cors({
+  origin: '*',
+  methods: ['GET', 'POST'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  credentials: false
+}));
 
 // Middleware
 app.use(express.json());
