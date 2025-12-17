@@ -23,6 +23,12 @@ app.use(cors({
   credentials: false
 }));
 
+// Debug header middleware - temporary version identifier
+app.use((req, res, next) => {
+  res.setHeader('X-Sitemap-Scraper-Version', 'cors-enabled');
+  next();
+});
+
 // Middleware
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
