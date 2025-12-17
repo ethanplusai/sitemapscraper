@@ -11,6 +11,7 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const { startCrawl, runCrawlWithErrorHandling, getJobStatus } = require('./crawl');
+const supabase = require('./supabase');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -145,12 +146,91 @@ app.get('/crawl/:jobId', async (req, res) => {
   }
 });
 
+/**
+ * GET /crawl/:jobId/pages
+ * Gets all crawled pages for a specific crawl job
+ * 
+ * Response:
+ *   Array of page objects:
+ *   [
+ *     {
+ *       normalized_url: string,
+ *       original_url: string,
+ *       status_code: number,
+ *       title: string | null,
+ *       h1: string | null,
+ *       meta_title: string | null,
+ *       meta_description: string | null
+ *     },
+ *     ...
+ *   ]
+ */
+app.get('/crawl/:jobId/pages', async (req, res) => {
+  try {
+    const { jobId } = req.params;
+
+    if (!jobId) {
+      console.error('[API] GET /crawl/:jobId/pages - Missing jobId parameter');
+      return res.status(400).json({ 
+        error: 'jobId is required',
+        message: 'Please provide a crawl job ID'
+      });
+    }
+
+    console.log(`[API] GET /crawl/:jobId/pages - Fetching pages for job ${jobId}`);
+
+    // Query Supabase pages table filtered by crawl_job_id
+    const { data: pages, error } = await supabase
+      .from('pages')
+      .select('normalized_url, url, status_code, title, h1, meta_description')
+      .eq('crawl_job_id', jobId)
+      .order('normalized_url', { ascending: true });
+
+    if (error) {
+      console.error(`[API] GET /crawl/:jobId/pages - Supabase error for job ${jobId}:`, error);
+      return res.status(500).json({ 
+        error: 'Failed to fetch pages',
+        message: error.message 
+      });
+    }
+
+    if (!pages) {
+      console.log(`[API] GET /crawl/:jobId/pages - No pages found for job ${jobId}`);
+      return res.json([]);
+    }
+
+    // Transform the data to match the required response format
+    // Note: meta_title doesn't exist in the database schema, so we return null
+    const formattedPages = pages.map(page => ({
+      normalized_url: page.normalized_url,
+      original_url: page.url || page.normalized_url, // url is the original URL
+      status_code: page.status_code,
+      title: page.title,
+      h1: page.h1,
+      meta_title: null, // Not stored in database, returning null
+      meta_description: page.meta_description
+    }));
+
+    console.log(`[API] GET /crawl/:jobId/pages - Returning ${formattedPages.length} pages for job ${jobId}`);
+
+    res.json(formattedPages);
+
+  } catch (error) {
+    console.error(`[API] GET /crawl/:jobId/pages - Unexpected error:`, error);
+    res.status(500).json({ 
+      error: 'Failed to get pages',
+      message: error.message 
+    });
+  }
+});
+
 // Start server
 const server = app.listen(PORT, () => {
   console.log(`[SERVER] SiteMapScraper API server running on port ${PORT}`);
   console.log(`[SERVER] Health check: GET /health`);
   console.log(`[SERVER] POST /crawl - Start a new crawl`);
   console.log(`[SERVER] GET /crawl/:jobId - Get crawl job status`);
+  console.log(`[SERVER] GET /crawl/:jobId/pages - Get crawled pages for a job`);
 });
 
 // Graceful shutdown handling
