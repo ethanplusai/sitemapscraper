@@ -111,6 +111,14 @@ async function extractPageContent(url, options = {}) {
     // Optionally include raw HTML
     if (includeRawHtml) {
       content.raw_html = fetchResult.html;
+      // DEBUG: Log that we're including raw HTML
+      console.log(`[EXTRACT CONTENT] Including raw HTML for ${url}:`, {
+        html_length: fetchResult.html ? fetchResult.html.length : 0,
+        html_preview: fetchResult.html ? fetchResult.html.substring(0, 100) : 'null',
+        html_type: typeof fetchResult.html
+      });
+    } else {
+      console.log(`[EXTRACT CONTENT] NOT including raw HTML for ${url} (includeRawHtml=false)`);
     }
     
     return content;

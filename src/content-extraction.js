@@ -200,6 +200,14 @@ async function runContentExtraction(extractionJob) {
           const normalizedUrl = normalizeUrl(url) || page.normalized_url;
           content.normalized_url = normalizedUrl;
           
+          // DEBUG: Log raw_html status before upsert
+          console.log(`[CONTENT EXTRACTION] Job ${jobId} - Content extracted for ${normalizedUrl}:`, {
+            has_raw_html: content.raw_html !== undefined && content.raw_html !== null,
+            raw_html_length: content.raw_html ? content.raw_html.length : 0,
+            raw_html_type: typeof content.raw_html,
+            raw_html_preview: content.raw_html ? content.raw_html.substring(0, 100) : 'null/undefined'
+          });
+          
           // Store/update extracted content (upsert by normalized_url and crawl_job_id)
           // Try upsert with explicit conflict resolution
           const upsertData = {
@@ -210,6 +218,13 @@ async function runContentExtraction(extractionJob) {
             headings: content.headings,
             raw_html: content.raw_html // Store raw HTML
           };
+          
+          // DEBUG: Log what we're about to upsert
+          console.log(`[CONTENT EXTRACTION] Job ${jobId} - Upsert data for ${normalizedUrl}:`, {
+            has_raw_html: upsertData.raw_html !== undefined && upsertData.raw_html !== null,
+            raw_html_length: upsertData.raw_html ? upsertData.raw_html.length : 0,
+            raw_html_in_payload: 'raw_html' in upsertData
+          });
           
           console.log(`[CONTENT EXTRACTION] Job ${jobId} - Attempting to upsert content for ${normalizedUrl}`);
           
@@ -258,10 +273,10 @@ async function runContentExtraction(extractionJob) {
             console.log(`[CONTENT EXTRACTION] Job ${jobId} - ✓ Successfully upserted content for ${normalizedUrl}`);
           }
           
-          // Verify the data was actually saved
+          // Verify the data was actually saved - check raw_html too
           const { data: verifyData, error: verifyError } = await supabase
             .from('page_content')
-            .select('normalized_url, fetched_at')
+            .select('normalized_url, fetched_at, raw_html')
             .eq('crawl_job_id', sitemapId)
             .eq('normalized_url', normalizedUrl)
             .single();
@@ -269,7 +284,16 @@ async function runContentExtraction(extractionJob) {
           if (verifyError || !verifyData) {
             console.warn(`[CONTENT EXTRACTION] Job ${jobId} - ⚠ Warning: Could not verify saved content for ${normalizedUrl}`);
           } else {
-            console.log(`[CONTENT EXTRACTION] Job ${jobId} - ✓ Verified content saved for ${normalizedUrl} at ${verifyData.fetched_at}`);
+            console.log(`[CONTENT EXTRACTION] Job ${jobId} - ✓ Verified content saved for ${normalizedUrl} at ${verifyData.fetched_at}`, {
+              raw_html_in_db: verifyData.raw_html !== null && verifyData.raw_html !== undefined,
+              raw_html_length_in_db: verifyData.raw_html ? verifyData.raw_html.length : 0,
+              raw_html_type_in_db: typeof verifyData.raw_html
+            });
+            
+            // Alert if raw_html is missing in DB but was present in payload
+            if (upsertData.raw_html && !verifyData.raw_html) {
+              console.error(`[CONTENT EXTRACTION] Job ${jobId} - ⚠⚠⚠ CRITICAL: raw_html was in payload but is NULL in database for ${normalizedUrl}!`);
+            }
           }
           
           pagesExtracted++;
