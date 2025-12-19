@@ -12,6 +12,7 @@ const express = require('express');
 const cors = require('cors');
 const { startCrawl, runCrawlWithErrorHandling, getJobStatus } = require('./crawl');
 const supabase = require('./supabase');
+const { extractPrimaryDomain, isPrimaryDomain } = require('./normalize');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -151,19 +152,32 @@ app.get('/crawl/:jobId', async (req, res) => {
  * Gets all crawled pages for a specific crawl job
  * 
  * Response:
- *   Array of page objects:
- *   [
- *     {
- *       normalized_url: string,
- *       original_url: string,
- *       status_code: number,
- *       title: string | null,
- *       h1: string | null,
- *       meta_title: string | null,
- *       meta_description: string | null
- *     },
- *     ...
- *   ]
+ *   {
+ *     pages: [
+ *       {
+ *         normalized_url: string,
+ *         original_url: string,
+ *         status_code: number,
+ *         title: string | null,
+ *         h1: string | null,
+ *         meta_description: string | null,
+ *         internal_links_out: number,
+ *         external_links_out: number,
+ *         internal_links_in: number,
+ *         external_links_in: number
+ *       },
+ *       ...
+ *     ],
+ *     external_links: {
+ *       "https://external.com/some-page": {
+ *         "occurrences": 6,
+ *         "pages_found_on": [
+ *           "https://example.com/",
+ *           "https://example.com/about"
+ *         ]
+ *       }
+ *     }
+ *   }
  */
 app.get('/crawl/:jobId/pages', async (req, res) => {
   try {
@@ -179,10 +193,34 @@ app.get('/crawl/:jobId/pages', async (req, res) => {
 
     console.log(`[API] GET /crawl/:jobId/pages - Fetching pages for job ${jobId}`);
 
+    // Get job to extract primary domain and external_links
+    const { data: job, error: jobError } = await supabase
+      .from('crawl_jobs')
+      .select('domain, external_links')
+      .eq('id', jobId)
+      .single();
+
+    if (jobError || !job) {
+      console.error(`[API] GET /crawl/:jobId/pages - Job not found: ${jobId}`);
+      return res.status(404).json({ 
+        error: 'Job not found',
+        message: `Crawl job ${jobId} does not exist`
+      });
+    }
+
+    // Extract primary domain
+    const primaryDomain = extractPrimaryDomain(job.domain);
+    if (!primaryDomain) {
+      return res.status(500).json({ 
+        error: 'Invalid job domain',
+        message: 'Unable to extract primary domain from job'
+      });
+    }
+
     // Query Supabase pages table filtered by crawl_job_id
     const { data: pages, error } = await supabase
       .from('pages')
-      .select('normalized_url, url, status_code, title, h1, meta_description')
+      .select('normalized_url, url, status_code, title, h1, meta_description, internal_links_out, external_links_out, internal_links_in, external_links_in')
       .eq('crawl_job_id', jobId)
       .order('normalized_url', { ascending: true });
 
@@ -194,26 +232,53 @@ app.get('/crawl/:jobId/pages', async (req, res) => {
       });
     }
 
-    if (!pages) {
+    if (!pages || pages.length === 0) {
       console.log(`[API] GET /crawl/:jobId/pages - No pages found for job ${jobId}`);
-      return res.json([]);
+      return res.json({
+        pages: [],
+        external_links: job.external_links || {}
+      });
+    }
+
+    // UI GUARDRAILS: Filter and deduplicate
+    // 1. Filter by primary domain (exact match only)
+    const primaryDomainPages = pages.filter(page => 
+      page.normalized_url && isPrimaryDomain(page.normalized_url, primaryDomain)
+    );
+
+    // 2. Deduplicate by normalized_url using Map
+    const pagesMap = new Map();
+    for (const page of primaryDomainPages) {
+      const normalizedUrl = page.normalized_url;
+      // Keep first occurrence (already sorted by normalized_url)
+      if (!pagesMap.has(normalizedUrl)) {
+        pagesMap.set(normalizedUrl, page);
+      }
     }
 
     // Transform the data to match the required response format
-    // Note: meta_title doesn't exist in the database schema, so we return null
-    const formattedPages = pages.map(page => ({
+    const formattedPages = Array.from(pagesMap.values()).map(page => ({
       normalized_url: page.normalized_url,
       original_url: page.url || page.normalized_url, // url is the original URL
       status_code: page.status_code,
       title: page.title,
       h1: page.h1,
-      meta_title: null, // Not stored in database, returning null
-      meta_description: page.meta_description
+      meta_description: page.meta_description,
+      internal_links_out: page.internal_links_out || 0,
+      external_links_out: page.external_links_out || 0,
+      internal_links_in: page.internal_links_in || 0,
+      external_links_in: page.external_links_in || 0
     }));
 
-    console.log(`[API] GET /crawl/:jobId/pages - Returning ${formattedPages.length} pages for job ${jobId}`);
+    // Get external links registry from job (stored as JSON)
+    const externalLinks = job.external_links || {};
 
-    res.json(formattedPages);
+    console.log(`[API] GET /crawl/:jobId/pages - Returning ${formattedPages.length} pages (filtered from ${pages.length} total) for job ${jobId}`);
+
+    res.json({
+      pages: formattedPages,
+      external_links: externalLinks
+    });
 
   } catch (error) {
     console.error(`[API] GET /crawl/:jobId/pages - Unexpected error:`, error);

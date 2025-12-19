@@ -9,12 +9,13 @@
 
 const { URL } = require('url');
 
-// Pagination query parameters to preserve during normalization
-const PAGINATION_PARAMS = new Set(['page', 'p', 'pagenum', 'paged', 'offset', 'start']);
-
 /**
- * Normalizes a URL by removing hash fragments, tracking parameters, and normalizing trailing slashes
- * Preserves pagination query parameters to allow paginated URLs to be treated as separate pages
+ * Normalizes a URL according to canonicalization rules:
+ * - lowercase hostname
+ * - strip leading www.
+ * - remove default ports
+ * - remove trailing slash except /
+ * - remove query string and hash for identity (but keep a representative original_url)
  * @param {string} url - The URL to normalize (must be absolute)
  * @returns {string|null} - The normalized URL, or null if invalid
  */
@@ -32,27 +33,17 @@ function normalizeUrl(url) {
     }
     parsedUrl.hostname = hostname;
 
+    // Remove default ports (http:80, https:443)
+    if ((parsedUrl.protocol === 'http:' && parsedUrl.port === '80') ||
+        (parsedUrl.protocol === 'https:' && parsedUrl.port === '443')) {
+      parsedUrl.port = '';
+    }
+
     // Remove hash fragments
     parsedUrl.hash = '';
 
-    // Remove tracking parameters but preserve pagination parameters
-    const trackingParams = ['fbclid', 'gclid'];
-    const paramsToRemove = new Set();
-    
-    // Find and remove utm_* parameters and other tracking params
-    parsedUrl.searchParams.forEach((value, key) => {
-      const keyLower = key.toLowerCase();
-      // Keep pagination params, remove tracking params
-      if (!PAGINATION_PARAMS.has(keyLower) && 
-          (keyLower.startsWith('utm_') || trackingParams.includes(keyLower))) {
-        paramsToRemove.add(key);
-      }
-    });
-
-    // Remove the tracking parameters
-    paramsToRemove.forEach(param => {
-      parsedUrl.searchParams.delete(param);
-    });
+    // Remove query string for identity (all query params removed)
+    parsedUrl.search = '';
 
     // Normalize pathname - remove duplicate slashes
     let pathname = parsedUrl.pathname.replace(/\/+/g, '/');
@@ -67,8 +58,8 @@ function normalizeUrl(url) {
       pathname = '/' + pathname;
     }
 
-    // Build the normalized URL with preserved query params (pagination)
-    const normalized = `${parsedUrl.protocol}//${parsedUrl.hostname}${pathname}${parsedUrl.search}`;
+    // Build the normalized URL without query string
+    const normalized = `${parsedUrl.protocol}//${parsedUrl.hostname}${parsedUrl.port ? ':' + parsedUrl.port : ''}${pathname}`;
 
     return normalized;
   } catch (error) {
@@ -78,82 +69,73 @@ function normalizeUrl(url) {
 }
 
 /**
- * Normalizes a URL and filters by domain (for link discovery during crawling)
- * @param {string} url - The URL to normalize (can be relative or absolute)
- * @param {string} baseDomain - The base domain to resolve relative URLs against
- * @returns {string|null} - The normalized absolute URL, or null if external or invalid
+ * Extracts the primary domain from a URL (normalized, without www.)
+ * @param {string} url - The URL to extract domain from
+ * @returns {string|null} - The normalized primary domain, or null if invalid
  */
-function normalizeAndFilterUrl(url, baseDomain) {
+function extractPrimaryDomain(url) {
   try {
-    // Extract just the domain from baseDomain (remove protocol and path if present)
-    let baseDomainOnly = baseDomain.replace(/^https?:\/\//, '').split('/')[0].toLowerCase();
-    
-    // Normalize www. and non-www hostnames to be identical (remove www. prefix)
-    if (baseDomainOnly.startsWith('www.')) {
-      baseDomainOnly = baseDomainOnly.substring(4);
-    }
-    
-    // Resolve relative URLs against baseDomain
-    // Ensure baseDomain has a protocol for URL resolution
-    const baseUrl = baseDomain.startsWith('http') 
-      ? baseDomain 
-      : `https://${baseDomainOnly}`;
-    
-    const parsedUrl = new URL(url, baseUrl);
-
-    // Lowercase protocol and hostname
-    parsedUrl.protocol = parsedUrl.protocol.toLowerCase();
+    const parsedUrl = new URL(url);
     let hostname = parsedUrl.hostname.toLowerCase();
     
-    // Normalize www. and non-www hostnames to be identical (remove www. prefix)
+    // Remove www. prefix
     if (hostname.startsWith('www.')) {
       hostname = hostname.substring(4);
     }
-    parsedUrl.hostname = hostname;
-
-    // Remove hash fragments
-    parsedUrl.hash = '';
-
-    // Remove tracking parameters (utm_*, fbclid, gclid)
-    const trackingParams = ['fbclid', 'gclid'];
-    const paramsToRemove = new Set();
     
-    // Find and remove utm_* parameters and other tracking params
-    parsedUrl.searchParams.forEach((value, key) => {
-      const keyLower = key.toLowerCase();
-      if (keyLower.startsWith('utm_') || trackingParams.includes(keyLower)) {
-        paramsToRemove.add(key);
-      }
-    });
+    return hostname;
+  } catch (error) {
+    return null;
+  }
+}
 
-    // Remove the tracking parameters
-    paramsToRemove.forEach(param => {
-      parsedUrl.searchParams.delete(param);
-    });
+/**
+ * Checks if a URL belongs to the primary domain (exact match only, no subdomains)
+ * @param {string} url - The URL to check
+ * @param {string} primaryDomain - The primary domain (normalized, without www.)
+ * @returns {boolean} - True if URL belongs to primary domain
+ */
+function isPrimaryDomain(url, primaryDomain) {
+  try {
+    const urlDomain = extractPrimaryDomain(url);
+    return urlDomain === primaryDomain;
+  } catch (error) {
+    return false;
+  }
+}
 
-    // Check if URL is same domain as baseDomain
-    // Both hostname and baseDomainOnly are already normalized (www. removed)
-    const urlDomain = parsedUrl.hostname; // Already normalized above
-
-    // Check if domains match exactly or if urlDomain is a subdomain of baseDomain
-    // e.g., blog.example.com matches example.com, but evil.com.example.com does not
-    // Note: www. has already been normalized away, so www.example.com and example.com both become example.com
-    if (urlDomain !== baseDomainOnly && !urlDomain.endsWith('.' + baseDomainOnly)) {
-      return null; // External URL, ignore
-    }
+/**
+ * Normalizes a URL and filters by domain (for link discovery during crawling)
+ * @param {string} url - The URL to normalize (can be relative or absolute)
+ * @param {string} baseUrl - The base URL to resolve relative URLs against
+ * @param {string} primaryDomain - The primary domain (normalized, without www.)
+ * @returns {Object} - { normalized: string|null, isExternal: boolean }
+ */
+function normalizeAndClassifyUrl(url, baseUrl, primaryDomain) {
+  try {
+    // Resolve relative URLs against baseUrl
+    const parsedUrl = new URL(url, baseUrl);
 
     // Normalize the URL
-    const normalized = normalizeUrl(`${parsedUrl.protocol}//${parsedUrl.hostname}${parsedUrl.pathname}`);
-    
-    return normalized;
+    const normalized = normalizeUrl(parsedUrl.href);
+    if (!normalized) {
+      return { normalized: null, isExternal: true };
+    }
+
+    // Check if URL belongs to primary domain (exact match only)
+    const urlDomain = extractPrimaryDomain(normalized);
+    const isExternal = urlDomain !== primaryDomain;
+
+    return { normalized, isExternal };
   } catch (error) {
-    // Invalid URL, return null
-    return null;
+    return { normalized: null, isExternal: true };
   }
 }
 
 module.exports = {
   normalizeUrl,
-  normalizeAndFilterUrl
+  extractPrimaryDomain,
+  isPrimaryDomain,
+  normalizeAndClassifyUrl
 };
 

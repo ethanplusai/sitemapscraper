@@ -13,7 +13,7 @@ require('dotenv').config();
 const supabase = require('./supabase');
 const { fetchPage } = require('./fetch');
 const { extractPageData, extractLinks } = require('./extract');
-const { normalizeUrl } = require('./normalize');
+const { normalizeUrl, extractPrimaryDomain, isPrimaryDomain, normalizeAndClassifyUrl } = require('./normalize');
 const { compareUrls } = require('./compare');
 const { URL } = require('url');
 const fs = require('fs');
@@ -216,11 +216,31 @@ async function runCrawl(job) {
   console.log(`[CRAWL START] Job ${job.id} - Seed URL: ${seedUrl}`);
   console.log(`[CRAWL START] Job ${job.id} - Max pages: ${MAX_PAGES}, Max depth: ${MAX_DEPTH}`);
 
+  // Extract primary domain (normalized, without www.)
+  const primaryDomain = extractPrimaryDomain(seedUrl);
+  if (!primaryDomain) {
+    console.error(`[CRAWL FAILED] Job ${job.id} - Invalid seed URL: ${seedUrl}`);
+    await updateJobStatus(job.id, 'failed', {
+      error_message: `Invalid seed URL: ${seedUrl}`,
+      stop_reason: 'invalid_seed_url'
+    });
+    return;
+  }
+
   // Initialize BFS queue and data structures first
   const queue = [{ url: seedUrl, depth: 0 }];
   const seenUrls = new Set(); // URLs that have been enqueued (normalized)
-  const visitedNormalizedUrls = new Set(); // URLs that have been crawled (normalized) - global deduplication
+  const pagesMap = new Map(); // Map<normalized_url, Page> - primary deduplication store
   const originalUrlsMap = new Map(); // Maps normalized URL -> original URL (for CSV export)
+  
+  // External link registry: Map<normalized_external_url, { occurrences: number, pages_found_on: Set<normalized_internal_url> }>
+  const externalLinksRegistry = new Map();
+  
+  // Link metrics tracking: Map<normalized_url, { internal_links_out: number, external_links_out: number }>
+  const linkMetricsMap = new Map();
+  
+  // Incoming links tracking: Map<normalized_target_url, { internal_count: number, external_count: number }>
+  const incomingLinksMap = new Map();
   
   // Crawl statistics - declare before timeout/stall detection
   let pagesCrawled = 0;
@@ -228,6 +248,12 @@ async function runCrawl(job) {
   let totalUrlsEnqueued = 0;
   let totalDuplicatesSkipped = 0;
   let maxDepthReached = 0;
+  
+  // Initialize link metrics for seed URL
+  linkMetricsMap.set(normalizeUrl(seedUrl) || seedUrl, {
+    internal_links_out: 0,
+    external_links_out: 0
+  });
 
   // Timeout and stall detection
   const MAX_RUNTIME_MS = 15 * 60 * 1000; // 15 minutes
@@ -244,7 +270,7 @@ async function runCrawl(job) {
     await updateJobStatus(job.id, 'failed', {
       error_message: 'Crawl exceeded maximum runtime of 15 minutes',
       stop_reason: 'timeout',
-      pages_discovered: visitedNormalizedUrls.size,
+      pages_discovered: pagesMap.size,
       pages_crawled: pagesCrawled,
       duplicates_skipped: totalDuplicatesSkipped
     });
@@ -262,7 +288,7 @@ async function runCrawl(job) {
       await updateJobStatus(job.id, 'failed', {
         error_message: `Crawl stalled - no activity for ${Math.round(timeSinceLastActivity / 1000)} seconds`,
         stop_reason: 'stalled',
-        pages_discovered: visitedNormalizedUrls.size,
+        pages_discovered: pagesMap.size,
         pages_crawled: pagesCrawled,
         duplicates_skipped: totalDuplicatesSkipped
       });
@@ -274,48 +300,59 @@ async function runCrawl(job) {
   // Load already crawled URLs from Supabase for this job
   const { data: existingPages } = await supabase
     .from('pages')
-    .select('normalized_url, url')
+    .select('normalized_url, url, internal_links_out, external_links_out, internal_links_in, external_links_in')
     .eq('crawl_job_id', job.id);
 
   if (existingPages) {
     existingPages.forEach(page => {
       if (page.normalized_url) {
-        // Add to both sets since they've been both seen and visited
-        seenUrls.add(page.normalized_url);
-        visitedNormalizedUrls.add(page.normalized_url);
-        // Store original URL if available, otherwise use normalized
-        const originalUrl = page.url || page.normalized_url;
-        originalUrlsMap.set(page.normalized_url, originalUrl);
+        // Only load pages that belong to primary domain
+        if (isPrimaryDomain(page.normalized_url, primaryDomain)) {
+          // Add to seenUrls since they've been enqueued
+          seenUrls.add(page.normalized_url);
+          // Store in pagesMap
+          pagesMap.set(page.normalized_url, {
+            normalized_url: page.normalized_url,
+            original_url: page.url || page.normalized_url,
+            status_code: page.status_code,
+            title: page.title,
+            h1: page.h1,
+            meta_description: page.meta_description,
+            internal_links_out: page.internal_links_out || 0,
+            external_links_out: page.external_links_out || 0,
+            internal_links_in: page.internal_links_in || 0,
+            external_links_in: page.external_links_in || 0
+          });
+          // Store original URL
+          const originalUrl = page.url || page.normalized_url;
+          originalUrlsMap.set(page.normalized_url, originalUrl);
+          // Initialize link metrics
+          linkMetricsMap.set(page.normalized_url, {
+            internal_links_out: page.internal_links_out || 0,
+            external_links_out: page.external_links_out || 0
+          });
+        }
       }
     });
-    console.log(`[CRAWL START] Job ${job.id} - Found ${existingPages.length} existing pages for this job`);
+    console.log(`[CRAWL START] Job ${job.id} - Found ${pagesMap.size} existing pages for this job (filtered to primary domain)`);
   }
 
   // Normalize and add seed URL to seenUrls (it's been enqueued)
   const seedNormalized = normalizeUrl(seedUrl);
-  if (seedNormalized) {
+  if (seedNormalized && isPrimaryDomain(seedNormalized, primaryDomain)) {
     seenUrls.add(seedNormalized);
     // Store original seed URL (preserves www. if present)
     originalUrlsMap.set(seedNormalized, seedUrl);
-  }
-
-  // Extract hostname from seed URL for same-domain filtering
-  // Normalize www. and non-www hostnames to be identical
-  let seedHostname;
-  try {
-    seedHostname = new URL(seedUrl).hostname.toLowerCase();
-    // Remove www. prefix for consistent comparison
-    if (seedHostname.startsWith('www.')) {
-      seedHostname = seedHostname.substring(4);
-    }
-  } catch (error) {
-    console.error(`[CRAWL FAILED] Job ${job.id} - Invalid seed URL: ${seedUrl}`);
+  } else {
+    console.error(`[CRAWL FAILED] Job ${job.id} - Seed URL does not belong to primary domain: ${seedUrl}`);
     await updateJobStatus(job.id, 'failed', {
-      error_message: `Invalid seed URL: ${seedUrl}`,
+      error_message: `Seed URL does not belong to primary domain: ${seedUrl}`,
       stop_reason: 'invalid_seed_url'
     });
     return;
   }
+  
+  console.log(`[CRAWL START] Job ${job.id} - Primary domain: ${primaryDomain}`);
 
   // BFS crawl loop
   while (queue.length > 0 && pagesCrawled < MAX_PAGES) {
@@ -341,8 +378,14 @@ async function runCrawl(job) {
       continue;
     }
 
-    // Skip if already crawled (shouldn't happen if deduplication works, but safety check)
-    if (visitedNormalizedUrls.has(normalizedUrl)) {
+    // PRIMARY DOMAIN ALLOWLIST: Only allow pages from primary domain (exact match, no subdomains)
+    if (!isPrimaryDomain(normalizedUrl, primaryDomain)) {
+      console.log(`[SKIP] Job ${job.id} - ${absoluteUrl} - skipped due to external domain (not primary domain: ${primaryDomain})`);
+      continue; // Skip external URLs
+    }
+
+    // Skip if already crawled (Map-based deduplication)
+    if (pagesMap.has(normalizedUrl)) {
       console.log(`[SKIP] Job ${job.id} - ${absoluteUrl} - skipped due to duplicate normalized URL (already crawled): ${normalizedUrl}`);
       totalDuplicatesSkipped++;
       continue;
@@ -355,25 +398,7 @@ async function runCrawl(job) {
       continue;
     }
 
-    // Check if URL is on the same hostname (www. and non-www are treated as identical)
-    try {
-      let urlHostname = new URL(absoluteUrl).hostname.toLowerCase();
-      // Normalize www. prefix for comparison
-      if (urlHostname.startsWith('www.')) {
-        urlHostname = urlHostname.substring(4);
-      }
-      // seedHostname is already normalized (www. removed)
-      if (urlHostname !== seedHostname && !urlHostname.endsWith('.' + seedHostname)) {
-        console.log(`[SKIP] Job ${job.id} - ${absoluteUrl} - skipped due to external domain (${urlHostname} vs ${seedHostname})`);
-        continue; // Skip external URLs
-      }
-    } catch (error) {
-      console.log(`[SKIP] Job ${job.id} - ${absoluteUrl} - skipped due to invalid URL format`);
-      continue; // Skip invalid URLs
-    }
-
-    // Mark as visited (crawled) - this URL is now being processed
-    visitedNormalizedUrls.add(normalizedUrl);
+    // Mark as being processed
     pagesCrawled++;
     
     // Update max depth reached
@@ -387,11 +412,11 @@ async function runCrawl(job) {
     try {
       // Log progress with metrics
       console.log(`[PROGRESS] Job ${job.id} - Crawling page ${pagesCrawled}/${MAX_PAGES} (depth ${depth}): ${absoluteUrl}`);
-      console.log(`[PROGRESS] Discovered: ${visitedNormalizedUrls.size} | Crawled: ${pagesCrawled} | Duplicates skipped: ${totalDuplicatesSkipped}`);
+      console.log(`[PROGRESS] Discovered: ${pagesMap.size} | Crawled: ${pagesCrawled} | Duplicates skipped: ${totalDuplicatesSkipped}`);
       
       // Update job progress in database (non-blocking)
       updateJobStatus(job.id, 'running', {
-        pages_discovered: visitedNormalizedUrls.size,
+        pages_discovered: pagesMap.size,
         pages_crawled: pagesCrawled,
         duplicates_skipped: totalDuplicatesSkipped,
         last_activity_at: new Date().toISOString()
@@ -419,33 +444,114 @@ async function runCrawl(job) {
       const originalUrl = fetchResult.url;
       originalUrlsMap.set(normalizedUrl, originalUrl);
 
-      // Store the page in Supabase
-      const { error: insertError } = await supabase
-        .from('pages')
-        .insert({
-          crawl_job_id: job.id,
-          url: pageData.url,
-          normalized_url: normalizedUrl,
-          status_code: fetchResult.status,
-          title: pageData.title,
-          meta_description: pageData.metaDescription,
-          h1: pageData.h1,
-          canonical: pageData.canonical,
-          depth: depth
-        });
-
-      if (insertError) {
-        console.error(`[ERROR] Job ${job.id} - Error storing page ${pageData.url}:`, insertError);
-      } else {
-        console.log(`[PROGRESS] Job ${job.id} - ✓ Stored page: ${normalizedUrl}`);
-      }
+      // Initialize link metrics for this page
+      let internalLinksOut = 0;
+      let externalLinksOut = 0;
 
       // Extract links from the page
       const links = extractLinks(fetchResult.html);
       totalUrlsDiscovered += links.length;
       console.log(`[PROGRESS] Job ${job.id} - Found ${links.length} links on ${absoluteUrl}`);
 
-      // Process and enqueue new links
+      // Process links to classify and track metrics
+      for (const link of links) {
+        const skipCheck = shouldSkipUrl(link);
+        if (skipCheck.skip) {
+          continue;
+        }
+
+        // Resolve relative URL to absolute
+        const resolvedLink = resolveUrl(link, fetchResult.url);
+        if (!resolvedLink) {
+          continue;
+        }
+
+        // Normalize and classify the link
+        const { normalized: normalizedLink, isExternal } = normalizeAndClassifyUrl(link, fetchResult.url, primaryDomain);
+        
+        if (isExternal) {
+          // External link - track in registry
+          if (normalizedLink) {
+            if (!externalLinksRegistry.has(normalizedLink)) {
+              externalLinksRegistry.set(normalizedLink, {
+                occurrences: 0,
+                pages_found_on: new Set()
+              });
+            }
+            const registryEntry = externalLinksRegistry.get(normalizedLink);
+            registryEntry.occurrences++;
+            registryEntry.pages_found_on.add(normalizedUrl);
+          }
+          externalLinksOut++;
+          
+          // Track external link pointing TO this page (if someone links to us externally)
+          // This is rare but we track it
+        } else {
+          // Internal link
+          internalLinksOut++;
+          
+          // Track incoming internal link for the target page
+          if (normalizedLink && normalizedLink !== normalizedUrl) {
+            if (!incomingLinksMap.has(normalizedLink)) {
+              incomingLinksMap.set(normalizedLink, { internal_count: 0, external_count: 0 });
+            }
+            incomingLinksMap.get(normalizedLink).internal_count++;
+          }
+        }
+      }
+
+      // Store link metrics
+      linkMetricsMap.set(normalizedUrl, {
+        internal_links_out: internalLinksOut,
+        external_links_out: externalLinksOut
+      });
+
+      // Get incoming link counts
+      const incomingLinks = incomingLinksMap.get(normalizedUrl) || { internal_count: 0, external_count: 0 };
+      
+      // Create page object
+      const pageObject = {
+        normalized_url: normalizedUrl,
+        original_url: originalUrl,
+        status_code: fetchResult.status,
+        title: pageData.title,
+        h1: pageData.h1,
+        meta_description: pageData.metaDescription,
+        internal_links_out: internalLinksOut,
+        external_links_out: externalLinksOut,
+        internal_links_in: incomingLinks.internal_count,
+        external_links_in: incomingLinks.external_count
+      };
+
+      // Store in pagesMap (deduplication)
+      pagesMap.set(normalizedUrl, pageObject);
+
+      // Store the page in Supabase
+      const { error: insertError } = await supabase
+        .from('pages')
+        .insert({
+          crawl_job_id: job.id,
+          url: originalUrl,
+          normalized_url: normalizedUrl,
+          status_code: fetchResult.status,
+          title: pageData.title,
+          meta_description: pageData.metaDescription,
+          h1: pageData.h1,
+          canonical: pageData.canonical,
+          depth: depth,
+          internal_links_out: internalLinksOut,
+          external_links_out: externalLinksOut,
+          internal_links_in: incomingLinks.internal_count,
+          external_links_in: incomingLinks.external_count
+        });
+
+      if (insertError) {
+        console.error(`[ERROR] Job ${job.id} - Error storing page ${pageData.url}:`, insertError);
+      } else {
+        console.log(`[PROGRESS] Job ${job.id} - ✓ Stored page: ${normalizedUrl} (internal: ${internalLinksOut}, external: ${externalLinksOut})`);
+      }
+
+      // Process and enqueue new internal links (external links already tracked above)
       let enqueuedCount = 0;
       let skippedCount = 0;
       let duplicatesSkipped = 0;
@@ -464,38 +570,23 @@ async function runCrawl(job) {
           continue;
         }
 
-        // Check if on same hostname first (before normalization to avoid unnecessary work)
-        // www. and non-www are treated as identical
-        let isExternal = false;
-        try {
-          let linkHostname = new URL(resolvedLink).hostname.toLowerCase();
-          // Normalize www. prefix for comparison
-          if (linkHostname.startsWith('www.')) {
-            linkHostname = linkHostname.substring(4);
-          }
-          // seedHostname is already normalized (www. removed)
-          if (linkHostname !== seedHostname && !linkHostname.endsWith('.' + seedHostname)) {
-            isExternal = true;
-          }
-        } catch (error) {
-          skippedCount++;
-          continue; // Skip invalid URLs
-        }
-
-        if (isExternal) {
-          skippedCount++;
-          continue; // Skip external URLs
-        }
-
-        // Normalize the link BEFORE checking if already seen
-        const normalizedLink = normalizeUrl(resolvedLink);
-        if (!normalizedLink) {
+        // Normalize and classify the link
+        const { normalized: normalizedLink, isExternal } = normalizeAndClassifyUrl(link, fetchResult.url, primaryDomain);
+        
+        if (isExternal || !normalizedLink) {
+          // External links already tracked above, skip enqueueing
           skippedCount++;
           continue;
         }
 
-        // Check if already seen (enqueued) or visited (crawled) - deduplication check
-        if (seenUrls.has(normalizedLink)) {
+        // PRIMARY DOMAIN ALLOWLIST: Only enqueue internal links from primary domain
+        if (!isPrimaryDomain(normalizedLink, primaryDomain)) {
+          skippedCount++;
+          continue;
+        }
+
+        // Check if already seen (enqueued) or crawled - deduplication check
+        if (seenUrls.has(normalizedLink) || pagesMap.has(normalizedLink)) {
           console.log(`[SKIP] Job ${job.id} - ${resolvedLink} - skipped due to duplicate normalized URL (already enqueued or crawled): ${normalizedLink}`);
           skippedCount++;
           duplicatesSkipped++;
@@ -531,17 +622,56 @@ async function runCrawl(job) {
   if (timeoutId) clearTimeout(timeoutId);
   if (stallCheckInterval) clearInterval(stallCheckInterval);
 
+  // Update pages in database with final link metrics (incoming links are already calculated)
+  console.log(`[CRAWL COMPLETION] Job ${job.id} - Updating link metrics in database...`);
+  for (const [normalizedUrl, page] of pagesMap.entries()) {
+    // Get final incoming link counts (may have been updated by later pages)
+    const incomingLinks = incomingLinksMap.get(normalizedUrl) || { internal_count: 0, external_count: 0 };
+    page.internal_links_in = incomingLinks.internal_count;
+    page.external_links_in = incomingLinks.external_count;
+    
+    await supabase
+      .from('pages')
+      .update({
+        internal_links_out: page.internal_links_out,
+        external_links_out: page.external_links_out,
+        internal_links_in: page.internal_links_in,
+        external_links_in: page.external_links_in
+      })
+      .eq('crawl_job_id', job.id)
+      .eq('normalized_url', normalizedUrl);
+  }
+
+  // Store external links registry in database (we'll create a table for this or store as JSON)
+  // For now, we'll return it in the API response. We can store it in a separate table later.
+  // Store as JSON in crawl_jobs table or create external_links table
+  const externalLinksData = {};
+  for (const [normalizedExternalUrl, registry] of externalLinksRegistry.entries()) {
+    externalLinksData[normalizedExternalUrl] = {
+      occurrences: registry.occurrences,
+      pages_found_on: Array.from(registry.pages_found_on)
+    };
+  }
+  
+  // Update job with external links registry (store as JSON)
+  await supabase
+    .from('crawl_jobs')
+    .update({
+      external_links: externalLinksData
+    })
+    .eq('id', job.id);
+
   // Determine stop reason
   const stopReason = pagesCrawled >= MAX_PAGES 
     ? `MAX_PAGES limit reached (${MAX_PAGES})` 
     : 'Queue exhausted';
 
   console.log(`[CRAWL COMPLETION] Job ${job.id} - Crawl finished. Reason: ${stopReason}`);
-  console.log(`[CRAWL COMPLETION] Job ${job.id} - Final stats: ${pagesCrawled} pages crawled, ${visitedNormalizedUrls.size} unique URLs discovered, ${totalDuplicatesSkipped} duplicates skipped`);
+  console.log(`[CRAWL COMPLETION] Job ${job.id} - Final stats: ${pagesCrawled} pages crawled, ${pagesMap.size} unique URLs discovered, ${totalDuplicatesSkipped} duplicates skipped`);
 
   // Update crawl job status to "completed" with summary
   await updateJobStatus(job.id, 'completed', {
-    pages_discovered: visitedNormalizedUrls.size,
+    pages_discovered: pagesMap.size,
     pages_crawled: pagesCrawled,
     duplicates_skipped: totalDuplicatesSkipped,
     stop_reason: stopReason
@@ -550,7 +680,7 @@ async function runCrawl(job) {
   // Export crawl results to CSV
   const csvFilePath = path.join(__dirname, '../crawl-results.csv');
   console.log(`[CRAWL COMPLETION] Job ${job.id} - Exporting crawl results to CSV`);
-  await exportCrawlResultsToCsv(visitedNormalizedUrls, originalUrlsMap, csvFilePath, job.id);
+  await exportCrawlResultsToCsv(new Set(pagesMap.keys()), originalUrlsMap, csvFilePath, job.id);
 
   // Run comparison with ScreamingFrog URLs
   console.log(`[CRAWL COMPLETION] Job ${job.id} - Running comparison with ScreamingFrog URLs`);
@@ -564,17 +694,19 @@ async function runCrawl(job) {
   // Output crawl summary
   console.log(`[CRAWL COMPLETION] Job ${job.id} - Final Summary:`);
   console.log(`[CRAWL COMPLETION] Job ${job.id} - Domain: ${domain}`);
+  console.log(`[CRAWL COMPLETION] Job ${job.id} - Primary Domain: ${primaryDomain}`);
   console.log(`[CRAWL COMPLETION] Job ${job.id} - Seed URL: ${seedUrl}`);
-  console.log(`[CRAWL COMPLETION] Job ${job.id} - Total pages discovered: ${seenUrls.size}`);
-  console.log(`[CRAWL COMPLETION] Job ${job.id} - Total unique normalized URLs stored: ${visitedNormalizedUrls.size}`);
+  console.log(`[CRAWL COMPLETION] Job ${job.id} - Total pages discovered: ${pagesMap.size}`);
+  console.log(`[CRAWL COMPLETION] Job ${job.id} - Total unique normalized URLs stored: ${pagesMap.size}`);
   console.log(`[CRAWL COMPLETION] Job ${job.id} - Total skipped as duplicates: ${totalDuplicatesSkipped}`);
   console.log(`[CRAWL COMPLETION] Job ${job.id} - Total pages crawled: ${pagesCrawled}`);
   console.log(`[CRAWL COMPLETION] Job ${job.id} - Total URLs discovered (raw links): ${totalUrlsDiscovered}`);
   console.log(`[CRAWL COMPLETION] Job ${job.id} - Total URLs enqueued: ${totalUrlsEnqueued}`);
+  console.log(`[CRAWL COMPLETION] Job ${job.id} - External links found: ${externalLinksRegistry.size}`);
   console.log(`[CRAWL COMPLETION] Job ${job.id} - Max depth reached: ${maxDepthReached}`);
   console.log(`[CRAWL COMPLETION] Job ${job.id} - Stop reason: ${stopReason}`);
   console.log(`[CRAWL COMPLETED] Job ${job.id} - Successfully completed`);
-  console.log(`[CRAWL COMPLETED] Job ${job.id} - Final stats: ${pagesCrawled} pages crawled, ${visitedNormalizedUrls.size} unique URLs discovered, ${totalDuplicatesSkipped} duplicates skipped`);
+  console.log(`[CRAWL COMPLETED] Job ${job.id} - Final stats: ${pagesCrawled} pages crawled, ${pagesMap.size} unique URLs discovered, ${totalDuplicatesSkipped} duplicates skipped`);
 }
 
 /**
