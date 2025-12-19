@@ -359,18 +359,26 @@ async function runCrawl(job) {
   // Fail-safe: Track iterations with no new pages added
   let iterationsWithoutNewPages = 0;
   const MAX_ITERATIONS_WITHOUT_NEW_PAGES = 5;
+  
+  // Fail-safe: Track consecutive skipped items (when queue has items but all are skipped)
+  let consecutiveSkipped = 0;
+  const MAX_CONSECUTIVE_SKIPPED = 50; // If we skip 50 items in a row, something is wrong
 
   // BFS crawl loop - queue contains only normalized URLs
   while (queue.length > 0 && pagesCrawled < MAX_PAGES) {
     // TEMPORARY LOGGING: Queue size, visited count, pages count
-    console.log(`[QUEUE STATUS] Job ${job.id} - Queue: ${queue.length} | Visited: ${seenUrls.size} | Pages: ${pagesMap.size} | Crawled: ${pagesCrawled}`);
+    console.log(`[QUEUE STATUS] Job ${job.id} - Queue: ${queue.length} | Visited: ${seenUrls.size} | Pages: ${pagesMap.size} | Crawled: ${pagesCrawled} | Consecutive skipped: ${consecutiveSkipped}`);
     
     const { normalized_url: normalizedUrl, depth, original_url: queueOriginalUrl } = queue.shift();
+    
+    // Track if this item will be processed or skipped
+    let willSkip = false;
 
     // Skip if depth exceeds limit
     if (depth > MAX_DEPTH) {
       console.log(`[SKIP] Job ${job.id} - ${normalizedUrl} - skipped due to depth (${depth} > ${MAX_DEPTH})`);
-      continue;
+      consecutiveSkipped++;
+      willSkip = true;
     }
 
     // Queue already contains normalized URLs, so we can use it directly
@@ -384,24 +392,43 @@ async function runCrawl(job) {
 
     // PRIMARY DOMAIN ALLOWLIST: Only allow pages from primary domain (exact match, no subdomains)
     // This should already be enforced when enqueueing, but double-check for safety
-    if (!isPrimaryDomain(normalizedUrl, primaryDomain)) {
+    if (!willSkip && !isPrimaryDomain(normalizedUrl, primaryDomain)) {
       console.log(`[SKIP] Job ${job.id} - ${normalizedUrl} - skipped due to external domain (not primary domain: ${primaryDomain})`);
-      continue; // Skip external URLs
+      consecutiveSkipped++;
+      willSkip = true;
     }
 
     // Skip if already crawled (Map-based deduplication)
-    if (pagesMap.has(normalizedUrl)) {
+    if (!willSkip && pagesMap.has(normalizedUrl)) {
       console.log(`[SKIP] Job ${job.id} - ${normalizedUrl} - skipped due to duplicate normalized URL (already crawled)`);
       totalDuplicatesSkipped++;
-      continue;
+      consecutiveSkipped++;
+      willSkip = true;
     }
 
     // Check if URL should be skipped (protocol, extension, etc.) - check original URL
-    const skipCheck = shouldSkipUrl(absoluteUrl);
-    if (skipCheck.skip) {
-      console.log(`[SKIP] Job ${job.id} - ${normalizedUrl} - skipped due to ${skipCheck.reason}`);
+    if (!willSkip) {
+      const skipCheck = shouldSkipUrl(absoluteUrl);
+      if (skipCheck.skip) {
+        console.log(`[SKIP] Job ${job.id} - ${normalizedUrl} - skipped due to ${skipCheck.reason}`);
+        consecutiveSkipped++;
+        willSkip = true;
+      }
+    }
+    
+    // Fail-safe: If we've skipped too many consecutive items, break the loop
+    if (consecutiveSkipped >= MAX_CONSECUTIVE_SKIPPED) {
+      console.error(`[CRAWL FAILED] Job ${job.id} - Too many consecutive skipped items (${consecutiveSkipped}). Queue may contain only invalid/duplicate URLs. Terminating crawl.`);
+      break;
+    }
+    
+    // If item was skipped, continue to next item
+    if (willSkip) {
       continue;
     }
+    
+    // Reset consecutive skipped counter when we actually process an item
+    consecutiveSkipped = 0;
 
     // Mark as being processed
     pagesCrawled++;
@@ -641,9 +668,14 @@ async function runCrawl(job) {
       // Fail-safe: Track if new pages were added
       if (enqueuedCount === 0) {
         iterationsWithoutNewPages++;
-        if (iterationsWithoutNewPages >= MAX_ITERATIONS_WITHOUT_NEW_PAGES && queue.length === 0) {
-          console.log(`[CRAWL COMPLETION] Job ${job.id} - No new pages added after ${iterationsWithoutNewPages} iterations, queue empty - terminating crawl`);
-          break; // Exit loop - queue will be empty
+        // Break if queue is empty OR if we've had too many iterations without new pages (even if queue has items)
+        if (queue.length === 0 || iterationsWithoutNewPages >= MAX_ITERATIONS_WITHOUT_NEW_PAGES) {
+          if (queue.length === 0) {
+            console.log(`[CRAWL COMPLETION] Job ${job.id} - No new pages added after ${iterationsWithoutNewPages} iterations, queue empty - terminating crawl`);
+          } else {
+            console.log(`[CRAWL COMPLETION] Job ${job.id} - No new pages added after ${iterationsWithoutNewPages} iterations, but queue still has ${queue.length} items (likely all invalid) - terminating crawl`);
+          }
+          break; // Exit loop
         }
       } else {
         iterationsWithoutNewPages = 0; // Reset counter when new pages are added
@@ -713,9 +745,13 @@ async function runCrawl(job) {
   // Determine stop reason
   const stopReason = pagesCrawled >= MAX_PAGES 
     ? `MAX_PAGES limit reached (${MAX_PAGES})` 
+    : consecutiveSkipped >= MAX_CONSECUTIVE_SKIPPED
+    ? `Too many consecutive skipped items (${consecutiveSkipped}) - queue contained only invalid/duplicate URLs`
     : queue.length === 0
     ? 'Queue exhausted'
-    : `No new pages added after ${iterationsWithoutNewPages} iterations`;
+    : iterationsWithoutNewPages >= MAX_ITERATIONS_WITHOUT_NEW_PAGES
+    ? `No new pages added after ${iterationsWithoutNewPages} iterations`
+    : 'Unknown reason';
 
   console.log(`[CRAWL COMPLETION] Job ${job.id} - Crawl finished. Reason: ${stopReason}`);
   console.log(`[CRAWL COMPLETION] Job ${job.id} - Final stats: ${pagesCrawled} pages crawled, ${pagesMap.size} unique URLs discovered, ${totalDuplicatesSkipped} duplicates skipped`);
