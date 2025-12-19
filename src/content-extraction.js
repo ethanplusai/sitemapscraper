@@ -193,30 +193,83 @@ async function runContentExtraction(extractionJob) {
           // Use original URL for fetching
           const url = page.url || page.normalized_url;
           
-          // Extract content
-          const content = await extractPageContent(url, { includeRawHtml: false });
+          // Extract content (include raw HTML)
+          const content = await extractPageContent(url, { includeRawHtml: true });
           
           // Normalize URL for storage
           const normalizedUrl = normalizeUrl(url) || page.normalized_url;
           content.normalized_url = normalizedUrl;
           
           // Store/update extracted content (upsert by normalized_url and crawl_job_id)
-          const { error: insertError } = await supabase
+          // Try upsert with explicit conflict resolution
+          const upsertData = {
+            crawl_job_id: sitemapId,
+            normalized_url: normalizedUrl,
+            fetched_at: content.fetched_at,
+            clean_text: content.clean_text,
+            headings: content.headings,
+            raw_html: content.raw_html // Store raw HTML
+          };
+          
+          console.log(`[CONTENT EXTRACTION] Job ${jobId} - Attempting to upsert content for ${normalizedUrl}`);
+          
+          // Try upsert - Supabase may need the constraint name or column order
+          const { data: upsertResult, error: insertError } = await supabase
             .from('page_content')
-            .upsert({
-              crawl_job_id: sitemapId,
-              normalized_url: normalizedUrl,
-              fetched_at: content.fetched_at,
-              clean_text: content.clean_text,
-              headings: content.headings,
-              // Don't store raw_html by default to save space
-              // raw_html: content.raw_html
-            }, {
-              onConflict: 'crawl_job_id,normalized_url'
+            .upsert(upsertData, {
+              onConflict: 'normalized_url,crawl_job_id' // Try reversed order
             });
           
           if (insertError) {
-            throw new Error(`Database error: ${insertError.message}`);
+            // Log detailed error information
+            console.error(`[CONTENT EXTRACTION] Job ${jobId} - Database upsert error for ${normalizedUrl}:`, {
+              error: insertError.message,
+              code: insertError.code,
+              details: insertError.details,
+              hint: insertError.hint,
+              fullError: JSON.stringify(insertError, null, 2)
+            });
+            
+            // Try alternative: insert with conflict handling
+            console.log(`[CONTENT EXTRACTION] Job ${jobId} - Trying alternative insert approach for ${normalizedUrl}`);
+            
+            // First, try to delete existing record
+            const { error: deleteError } = await supabase
+              .from('page_content')
+              .delete()
+              .eq('crawl_job_id', sitemapId)
+              .eq('normalized_url', normalizedUrl);
+            
+            if (deleteError) {
+              console.error(`[CONTENT EXTRACTION] Job ${jobId} - Delete error (non-fatal):`, deleteError.message);
+            }
+            
+            // Then insert fresh
+            const { error: insertError2 } = await supabase
+              .from('page_content')
+              .insert(upsertData);
+            
+            if (insertError2) {
+              throw new Error(`Database error (upsert failed, insert also failed): ${insertError2.message}. Original: ${insertError.message}`);
+            } else {
+              console.log(`[CONTENT EXTRACTION] Job ${jobId} - ✓ Successfully inserted content for ${normalizedUrl} (using delete+insert method)`);
+            }
+          } else {
+            console.log(`[CONTENT EXTRACTION] Job ${jobId} - ✓ Successfully upserted content for ${normalizedUrl}`);
+          }
+          
+          // Verify the data was actually saved
+          const { data: verifyData, error: verifyError } = await supabase
+            .from('page_content')
+            .select('normalized_url, fetched_at')
+            .eq('crawl_job_id', sitemapId)
+            .eq('normalized_url', normalizedUrl)
+            .single();
+          
+          if (verifyError || !verifyData) {
+            console.warn(`[CONTENT EXTRACTION] Job ${jobId} - ⚠ Warning: Could not verify saved content for ${normalizedUrl}`);
+          } else {
+            console.log(`[CONTENT EXTRACTION] Job ${jobId} - ✓ Verified content saved for ${normalizedUrl} at ${verifyData.fetched_at}`);
           }
           
           pagesExtracted++;
@@ -247,16 +300,39 @@ async function runContentExtraction(extractionJob) {
       }
     }
     
+    // Verify final count in database
+    const { count: dbCount, error: countError } = await supabase
+      .from('page_content')
+      .select('*', { count: 'exact', head: true })
+      .eq('crawl_job_id', sitemapId);
+    
+    if (countError) {
+      console.error(`[CONTENT EXTRACTION] Job ${jobId} - Error counting saved records:`, countError.message);
+    } else {
+      console.log(`[CONTENT EXTRACTION] Job ${jobId} - Database verification: ${dbCount} records found in page_content table`);
+      if (dbCount !== pagesExtracted) {
+        console.warn(`[CONTENT EXTRACTION] Job ${jobId} - ⚠ Mismatch: Expected ${pagesExtracted} records, found ${dbCount} in database`);
+      }
+    }
+    
     // Mark job as completed
     await updateExtractionJobStatus(jobId, 'completed', {
       pages_total: pages.length,
       pages_extracted: pagesExtracted,
       pages_failed: pagesFailed,
+      pages_in_database: dbCount || null,
       failed_urls: failedUrls.length > 0 ? failedUrls : null
     });
     
     console.log(`[CONTENT EXTRACTION COMPLETION] Job ${jobId} - Completed`);
-    console.log(`[CONTENT EXTRACTION COMPLETION] Job ${jobId} - Total: ${pages.length}, Extracted: ${pagesExtracted}, Failed: ${pagesFailed}`);
+    console.log(`[CONTENT EXTRACTION COMPLETION] Job ${jobId} - Total: ${pages.length}, Extracted: ${pagesExtracted}, Failed: ${pagesFailed}, In DB: ${dbCount || 'unknown'}`);
+    
+    if (failedUrls.length > 0) {
+      console.log(`[CONTENT EXTRACTION COMPLETION] Job ${jobId} - Failed URLs:`);
+      failedUrls.forEach(({ url, error }) => {
+        console.log(`  - ${url}: ${error}`);
+      });
+    }
     
   } catch (error) {
     console.error(`[CONTENT EXTRACTION FAILED] Job ${jobId} - Error: ${error.message}`);

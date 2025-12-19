@@ -241,21 +241,41 @@ app.get('/crawl/:jobId/pages', async (req, res) => {
       });
     }
 
-    // UI GUARDRAILS: Filter and deduplicate
-    // 1. Filter by primary domain (exact match only)
-    const primaryDomainPages = pages.filter(page => 
-      page.normalized_url && isPrimaryDomain(page.normalized_url, primaryDomain)
-    );
+    // UI GUARDRAILS: Filter and deduplicate (CRITICAL - must be bulletproof)
+    // 1. Filter by primary domain (exact match only) - STRICT filtering
+    const primaryDomainPages = pages.filter(page => {
+      if (!page.normalized_url) {
+        console.warn(`[API] GET /crawl/:jobId/pages - Page missing normalized_url, skipping`);
+        return false;
+      }
+      const isPrimary = isPrimaryDomain(page.normalized_url, primaryDomain);
+      if (!isPrimary) {
+        console.warn(`[API] GET /crawl/:jobId/pages - Filtered out external domain: ${page.normalized_url} (primary: ${primaryDomain})`);
+      }
+      return isPrimary;
+    });
 
-    // 2. Deduplicate by normalized_url using Map
+    // 2. Deduplicate by normalized_url using Map - STRICT deduplication
     const pagesMap = new Map();
+    const seenUrls = new Set(); // Track for duplicate detection
     for (const page of primaryDomainPages) {
       const normalizedUrl = page.normalized_url;
-      // Keep first occurrence (already sorted by normalized_url)
-      if (!pagesMap.has(normalizedUrl)) {
-        pagesMap.set(normalizedUrl, page);
+      
+      // Normalize the normalized_url to ensure consistency (lowercase, trim)
+      const normalizedKey = normalizedUrl.toLowerCase().trim();
+      
+      // Check for duplicates
+      if (pagesMap.has(normalizedKey) || seenUrls.has(normalizedKey)) {
+        console.warn(`[API] GET /crawl/:jobId/pages - Duplicate detected and removed: ${normalizedUrl}`);
+        continue; // Skip duplicates
       }
+      
+      // Store in both Map and Set for tracking
+      pagesMap.set(normalizedKey, page);
+      seenUrls.add(normalizedKey);
     }
+    
+    console.log(`[API] GET /crawl/:jobId/pages - Filtered: ${pages.length} -> ${primaryDomainPages.length} (domain) -> ${pagesMap.size} (deduped)`);
 
     // Transform the data to match the required response format
     const formattedPages = Array.from(pagesMap.values()).map(page => ({

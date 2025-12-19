@@ -528,10 +528,23 @@ async function runCrawl(job) {
         external_links_in: incomingLinks.external_count
       };
 
+      // CRITICAL: Final validation before storing - ensure domain matches and not duplicate
+      // Double-check domain (defense in depth)
+      if (!isPrimaryDomain(normalizedUrl, primaryDomain)) {
+        console.error(`[ERROR] Job ${job.id} - CRITICAL: Attempted to store external domain page: ${normalizedUrl} (primary: ${primaryDomain})`);
+        continue; // Skip storing external domains
+      }
+      
+      // Double-check for duplicates (defense in depth)
+      if (pagesMap.has(normalizedUrl)) {
+        console.error(`[ERROR] Job ${job.id} - CRITICAL: Attempted to store duplicate page: ${normalizedUrl}`);
+        continue; // Skip storing duplicates
+      }
+      
       // Store in pagesMap (deduplication)
       pagesMap.set(normalizedUrl, pageObject);
 
-      // Store the page in Supabase
+      // Store the page in Supabase - with final validation
       const { error: insertError } = await supabase
         .from('pages')
         .insert({
@@ -551,7 +564,13 @@ async function runCrawl(job) {
         });
 
       if (insertError) {
-        console.error(`[ERROR] Job ${job.id} - Error storing page ${pageData.url}:`, insertError);
+        // Check if it's a duplicate key error (database-level constraint)
+        if (insertError.code === '23505' || insertError.message.includes('duplicate') || insertError.message.includes('unique')) {
+          console.warn(`[WARNING] Job ${job.id} - Duplicate detected at database level for ${normalizedUrl}: ${insertError.message}`);
+          // Don't count as error, just skip
+        } else {
+          console.error(`[ERROR] Job ${job.id} - Error storing page ${pageData.url}:`, insertError);
+        }
       } else {
         console.log(`[PROGRESS] Job ${job.id} - ✓ Stored page: ${normalizedUrl} (internal: ${internalLinksOut}, external: ${externalLinksOut})`);
       }
