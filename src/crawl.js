@@ -357,12 +357,13 @@ async function runCrawl(job) {
   console.log(`[CRAWL START] Job ${job.id} - Seed normalized: ${seedNormalizedForQueue}`);
   
   // Fail-safe: Track iterations with no new pages added
+  // Only trigger when queue is empty - don't stop early if queue still has items
   let iterationsWithoutNewPages = 0;
-  const MAX_ITERATIONS_WITHOUT_NEW_PAGES = 5;
+  const MAX_ITERATIONS_WITHOUT_NEW_PAGES = 10; // Increased threshold
   
   // Fail-safe: Track consecutive skipped items (when queue has items but all are skipped)
   let consecutiveSkipped = 0;
-  const MAX_CONSECUTIVE_SKIPPED = 50; // If we skip 50 items in a row, something is wrong
+  const MAX_CONSECUTIVE_SKIPPED = 100; // Increased threshold - allow more skips before giving up
 
   // BFS crawl loop - queue contains only normalized URLs
   while (queue.length > 0 && pagesCrawled < MAX_PAGES) {
@@ -483,7 +484,7 @@ async function runCrawl(job) {
       // Extract links from the page
       const links = extractLinks(fetchResult.html);
       totalUrlsDiscovered += links.length;
-      console.log(`[PROGRESS] Job ${job.id} - Found ${links.length} links on ${absoluteUrl}`);
+      console.log(`[PROGRESS] Job ${job.id} - Found ${links.length} raw links on ${absoluteUrl}`);
 
       // Process links to classify and track metrics
       for (const link of links) {
@@ -666,16 +667,19 @@ async function runCrawl(job) {
       }
 
       // Fail-safe: Track if new pages were added
+      // IMPORTANT: Only terminate if queue is empty - don't stop early just because current page had no new links
       if (enqueuedCount === 0) {
         iterationsWithoutNewPages++;
-        // Break if queue is empty OR if we've had too many iterations without new pages (even if queue has items)
-        if (queue.length === 0 || iterationsWithoutNewPages >= MAX_ITERATIONS_WITHOUT_NEW_PAGES) {
-          if (queue.length === 0) {
+        // Only break if queue is empty - if queue has items, keep processing them
+        if (queue.length === 0) {
+          if (iterationsWithoutNewPages >= MAX_ITERATIONS_WITHOUT_NEW_PAGES) {
             console.log(`[CRAWL COMPLETION] Job ${job.id} - No new pages added after ${iterationsWithoutNewPages} iterations, queue empty - terminating crawl`);
-          } else {
-            console.log(`[CRAWL COMPLETION] Job ${job.id} - No new pages added after ${iterationsWithoutNewPages} iterations, but queue still has ${queue.length} items (likely all invalid) - terminating crawl`);
+            break; // Exit loop only when queue is empty
           }
-          break; // Exit loop
+        } else {
+          // Queue still has items - reset counter since we're making progress through the queue
+          // Don't penalize for pages that don't have new links - they're still valid pages
+          iterationsWithoutNewPages = 0;
         }
       } else {
         iterationsWithoutNewPages = 0; // Reset counter when new pages are added
@@ -683,6 +687,7 @@ async function runCrawl(job) {
 
       totalDuplicatesSkipped += duplicatesSkipped;
       console.log(`[PROGRESS] Job ${job.id} - Enqueued ${enqueuedCount} new links, skipped ${skippedCount} links (${duplicatesSkipped} duplicates) from ${normalizedUrl}`);
+      console.log(`[PROGRESS] Job ${job.id} - Link breakdown: ${links.length} total, ${internalLinksOut} internal, ${externalLinksOut} external, ${enqueuedCount} enqueued, ${skippedCount} skipped`);
 
     } catch (error) {
       console.error(`[ERROR] Job ${job.id} - Error processing ${normalizedUrl}:`, error.message);
