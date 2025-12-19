@@ -49,7 +49,7 @@ function extractHeadings(html) {
     h3: []
   };
   
-  // Extract h1 headings
+  // Extract h1 headings - preserve order of appearance
   $('h1').each((i, elem) => {
     const text = $(elem).text().trim();
     if (text) {
@@ -57,7 +57,7 @@ function extractHeadings(html) {
     }
   });
   
-  // Extract h2 headings
+  // Extract h2 headings - preserve order of appearance
   $('h2').each((i, elem) => {
     const text = $(elem).text().trim();
     if (text) {
@@ -65,7 +65,7 @@ function extractHeadings(html) {
     }
   });
   
-  // Extract h3 headings
+  // Extract h3 headings - preserve order of appearance
   $('h3').each((i, elem) => {
     const text = $(elem).text().trim();
     if (text) {
@@ -74,6 +74,114 @@ function extractHeadings(html) {
   });
   
   return headings;
+}
+
+/**
+ * Extracts SEO metadata from HTML
+ * Extracts title, meta description, canonical URL, robots, and Open Graph tags
+ * Do NOT infer or auto-generate missing values - store null if not present
+ * 
+ * @param {string} html - The HTML content
+ * @returns {Object} - SEO object with title, meta_description, canonical_url, robots, and og
+ */
+function extractSEO(html) {
+  const $ = cheerio.load(html);
+  
+  // Extract title from <title> tag
+  let title = $('title').first().text();
+  title = title ? title.trim() : null;
+  title = title || null; // Convert empty string to null
+  
+  // Extract meta description
+  let metaDescription = $('meta[name="description"]').attr('content');
+  metaDescription = metaDescription ? metaDescription.trim() : null;
+  metaDescription = metaDescription || null; // Convert empty string to null
+  
+  // Extract canonical URL from <link rel="canonical">
+  let canonicalUrl = $('link[rel="canonical"]').attr('href');
+  canonicalUrl = canonicalUrl ? canonicalUrl.trim() : null;
+  canonicalUrl = canonicalUrl || null; // Convert empty string to null
+  
+  // Extract robots meta tag
+  let robots = $('meta[name="robots"]').attr('content');
+  robots = robots ? robots.trim() : null;
+  robots = robots || null; // Convert empty string to null
+  
+  // Extract Open Graph tags
+  const og = {
+    title: null,
+    description: null,
+    image: null
+  };
+  
+  // og:title
+  let ogTitle = $('meta[property="og:title"]').attr('content');
+  ogTitle = ogTitle ? ogTitle.trim() : null;
+  og.title = ogTitle || null;
+  
+  // og:description
+  let ogDescription = $('meta[property="og:description"]').attr('content');
+  ogDescription = ogDescription ? ogDescription.trim() : null;
+  og.description = ogDescription || null;
+  
+  // og:image
+  let ogImage = $('meta[property="og:image"]').attr('content');
+  ogImage = ogImage ? ogImage.trim() : null;
+  og.image = ogImage || null;
+  
+  return {
+    title,
+    meta_description: metaDescription,
+    canonical_url: canonicalUrl,
+    robots,
+    og
+  };
+}
+
+/**
+ * Extracts JSON-LD schema from HTML
+ * Finds all <script type="application/ld+json"> tags and parses them as raw JSON
+ * Do NOT normalize, validate, merge, or classify - store as-is
+ * 
+ * @param {string} html - The HTML content
+ * @returns {Object} - Schema object with json_ld array
+ */
+function extractSchema(html) {
+  const $ = cheerio.load(html);
+  const jsonLdScripts = [];
+  
+  // Find all script tags with type="application/ld+json"
+  $('script[type="application/ld+json"]').each((i, elem) => {
+    const scriptContent = $(elem).html();
+    
+    if (!scriptContent) {
+      return; // Skip empty scripts
+    }
+    
+    try {
+      // Parse JSON safely - preserve as raw object, do not validate or normalize
+      const parsed = JSON.parse(scriptContent.trim());
+      
+      // Store as-is - could be object or array
+      // If it's an array, we'll store each item separately
+      // If it's an object, we'll store it as a single item in the array
+      if (Array.isArray(parsed)) {
+        // Multiple schemas in one script tag
+        jsonLdScripts.push(...parsed);
+      } else {
+        // Single schema object
+        jsonLdScripts.push(parsed);
+      }
+    } catch (error) {
+      // Log parsing error but continue extraction - do not fail the page
+      console.warn(`[EXTRACT SCHEMA] Failed to parse JSON-LD script at index ${i}: ${error.message}`);
+      // Skip this block and continue
+    }
+  });
+  
+  return {
+    json_ld: jsonLdScripts
+  };
 }
 
 /**
@@ -97,15 +205,52 @@ async function extractPageContent(url, options = {}) {
     // Extract clean text
     const cleanText = extractCleanText(fetchResult.html);
     
-    // Extract headings
+    // Extract headings (already structured as h1, h2, h3 arrays)
     const headings = extractHeadings(fetchResult.html);
     
-    // Build content object
+    // Extract SEO metadata (title, meta_description, canonical_url, robots, og tags)
+    // Failures in SEO extraction must NOT fail the page extraction
+    let seo = null;
+    try {
+      seo = extractSEO(fetchResult.html);
+    } catch (error) {
+      console.warn(`[EXTRACT CONTENT] SEO extraction failed for ${url}: ${error.message}`);
+      // Set default null values if extraction fails
+      seo = {
+        title: null,
+        meta_description: null,
+        canonical_url: null,
+        robots: null,
+        og: {
+          title: null,
+          description: null,
+          image: null
+        }
+      };
+    }
+    
+    // Extract JSON-LD schema (raw, non-interpreted)
+    // Failures in schema extraction must NOT fail the page extraction
+    let schema = null;
+    try {
+      schema = extractSchema(fetchResult.html);
+    } catch (error) {
+      console.warn(`[EXTRACT CONTENT] Schema extraction failed for ${url}: ${error.message}`);
+      // Set default empty array if extraction fails
+      schema = {
+        json_ld: []
+      };
+    }
+    
+    // Build content object with schema versioning
     const content = {
       normalized_url: url, // Will be normalized by caller
       fetched_at: new Date().toISOString(),
+      content_schema_version: '1.0', // Version field for future schema changes
       clean_text: cleanText,
-      headings: headings
+      headings: headings, // Already structured as { h1: [], h2: [], h3: [] }
+      seo: seo, // SEO metadata object
+      schema: schema // Schema object with json_ld array
     };
     
     // Optionally include raw HTML
@@ -130,6 +275,8 @@ async function extractPageContent(url, options = {}) {
 module.exports = {
   extractPageContent,
   extractCleanText,
-  extractHeadings
+  extractHeadings,
+  extractSEO,
+  extractSchema
 };
 

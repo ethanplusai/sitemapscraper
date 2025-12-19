@@ -214,8 +214,11 @@ async function runContentExtraction(extractionJob) {
             crawl_job_id: sitemapId,
             normalized_url: normalizedUrl,
             fetched_at: content.fetched_at,
+            content_schema_version: content.content_schema_version, // Schema versioning for future changes
             clean_text: content.clean_text,
-            headings: content.headings,
+            headings: content.headings, // Structured as { h1: [], h2: [], h3: [] }
+            seo: content.seo, // SEO metadata object (title, meta_description, canonical_url, robots, og)
+            schema: content.schema, // Schema object with json_ld array (raw, non-interpreted)
             raw_html: content.raw_html // Store raw HTML
           };
           
@@ -273,10 +276,10 @@ async function runContentExtraction(extractionJob) {
             console.log(`[CONTENT EXTRACTION] Job ${jobId} - ✓ Successfully upserted content for ${normalizedUrl}`);
           }
           
-          // Verify the data was actually saved - check raw_html too
+          // Verify the data was actually saved - check raw_html, seo, and schema too
           const { data: verifyData, error: verifyError } = await supabase
             .from('page_content')
-            .select('normalized_url, fetched_at, raw_html')
+            .select('normalized_url, fetched_at, raw_html, seo, schema, content_schema_version')
             .eq('crawl_job_id', sitemapId)
             .eq('normalized_url', normalizedUrl)
             .single();
@@ -287,12 +290,24 @@ async function runContentExtraction(extractionJob) {
             console.log(`[CONTENT EXTRACTION] Job ${jobId} - ✓ Verified content saved for ${normalizedUrl} at ${verifyData.fetched_at}`, {
               raw_html_in_db: verifyData.raw_html !== null && verifyData.raw_html !== undefined,
               raw_html_length_in_db: verifyData.raw_html ? verifyData.raw_html.length : 0,
-              raw_html_type_in_db: typeof verifyData.raw_html
+              seo_in_db: verifyData.seo !== null && verifyData.seo !== undefined,
+              schema_in_db: verifyData.schema !== null && verifyData.schema !== undefined,
+              schema_version_in_db: verifyData.content_schema_version
             });
             
             // Alert if raw_html is missing in DB but was present in payload
             if (upsertData.raw_html && !verifyData.raw_html) {
               console.error(`[CONTENT EXTRACTION] Job ${jobId} - ⚠⚠⚠ CRITICAL: raw_html was in payload but is NULL in database for ${normalizedUrl}!`);
+            }
+            
+            // Alert if SEO is missing in DB but was present in payload
+            if (upsertData.seo && !verifyData.seo) {
+              console.error(`[CONTENT EXTRACTION] Job ${jobId} - ⚠⚠⚠ CRITICAL: seo was in payload but is NULL in database for ${normalizedUrl}!`);
+            }
+            
+            // Alert if schema is missing in DB but was present in payload
+            if (upsertData.schema && !verifyData.schema) {
+              console.error(`[CONTENT EXTRACTION] Job ${jobId} - ⚠⚠⚠ CRITICAL: schema was in payload but is NULL in database for ${normalizedUrl}!`);
             }
           }
           
