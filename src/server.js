@@ -11,6 +11,7 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const { startCrawl, runCrawlWithErrorHandling, getJobStatus } = require('./crawl');
+const { startContentExtraction, runContentExtractionWithErrorHandling, getExtractionJobStatus } = require('./content-extraction');
 const supabase = require('./supabase');
 const { extractPrimaryDomain, isPrimaryDomain } = require('./normalize');
 
@@ -289,6 +290,133 @@ app.get('/crawl/:jobId/pages', async (req, res) => {
   }
 });
 
+/**
+ * POST /api/sitemaps/:sitemapId/extract-content
+ * Triggers batch content extraction for a sitemap (crawl job)
+ * 
+ * Request params:
+ *   sitemapId: string - The crawl_job_id (sitemap identifier)
+ * 
+ * Request body (optional):
+ *   { onlyMissing: boolean } - Only extract content for pages missing extracted content (default: true)
+ * 
+ * Response:
+ *   {
+ *     extraction_job_id: string,
+ *     status: "running",
+ *     message: "Content extraction job started successfully"
+ *   }
+ */
+app.post('/api/sitemaps/:sitemapId/extract-content', async (req, res) => {
+  try {
+    const { sitemapId } = req.params;
+    const { onlyMissing = true } = req.body;
+
+    if (!sitemapId) {
+      return res.status(400).json({ 
+        error: 'sitemapId is required',
+        message: 'Please provide a sitemap ID (crawl_job_id)'
+      });
+    }
+
+    console.log(`[API] POST /api/sitemaps/:sitemapId/extract-content - Starting extraction for sitemap ${sitemapId}`);
+
+    // Start content extraction job
+    const extractionJob = await startContentExtraction(sitemapId, { onlyMissing });
+
+    // Start extraction asynchronously (non-blocking)
+    // Don't await - let it run in the background
+    runContentExtractionWithErrorHandling(extractionJob).catch(err => {
+      // Error is already logged and job status updated in runContentExtractionWithErrorHandling
+      console.error(`[API] Background content extraction error for job ${extractionJob.id}:`, err.message);
+    });
+
+    // Return immediately with job ID and status
+    res.status(202).json({
+      extraction_job_id: extractionJob.id,
+      status: 'running',
+      message: 'Content extraction job started successfully',
+      only_missing: onlyMissing
+    });
+
+  } catch (error) {
+    console.error('[API] Error starting content extraction:', error);
+    res.status(500).json({ 
+      error: 'Failed to start content extraction',
+      message: error.message 
+    });
+  }
+});
+
+/**
+ * GET /api/sitemaps/:sitemapId/extract-content/:jobId
+ * Gets the status of a content extraction job
+ * 
+ * Response:
+ *   {
+ *     extraction_job_id: string,
+ *     crawl_job_id: string,
+ *     status: "running" | "completed" | "failed",
+ *     started_at: ISO timestamp,
+ *     completed_at: ISO timestamp | null,
+ *     failed_at: ISO timestamp | null,
+ *     pages_total: number | null,
+ *     pages_extracted: number | null,
+ *     pages_failed: number | null,
+ *     error_message: string | null
+ *   }
+ */
+app.get('/api/sitemaps/:sitemapId/extract-content/:jobId', async (req, res) => {
+  try {
+    const { sitemapId, jobId } = req.params;
+
+    if (!jobId) {
+      return res.status(400).json({ 
+        error: 'jobId is required',
+        message: 'Please provide an extraction job ID'
+      });
+    }
+
+    const jobStatus = await getExtractionJobStatus(jobId);
+
+    if (!jobStatus) {
+      return res.status(404).json({ 
+        error: 'Extraction job not found',
+        message: `Content extraction job ${jobId} does not exist`
+      });
+    }
+
+    // Verify the job belongs to the sitemap
+    if (jobStatus.crawl_job_id !== sitemapId) {
+      return res.status(400).json({ 
+        error: 'Job mismatch',
+        message: `Extraction job ${jobId} does not belong to sitemap ${sitemapId}`
+      });
+    }
+
+    res.json({
+      extraction_job_id: jobStatus.id,
+      crawl_job_id: jobStatus.crawl_job_id,
+      status: jobStatus.status,
+      started_at: jobStatus.started_at,
+      completed_at: jobStatus.completed_at,
+      failed_at: jobStatus.failed_at,
+      last_activity_at: jobStatus.last_activity_at,
+      pages_total: jobStatus.pages_total,
+      pages_extracted: jobStatus.pages_extracted,
+      pages_failed: jobStatus.pages_failed,
+      error_message: jobStatus.error_message
+    });
+
+  } catch (error) {
+    console.error('[API] Error getting extraction job status:', error);
+    res.status(500).json({ 
+      error: 'Failed to get extraction job status',
+      message: error.message 
+    });
+  }
+});
+
 // Start server
 const server = app.listen(PORT, () => {
   console.log(`[SERVER] SiteMapScraper API server running on port ${PORT}`);
@@ -296,6 +424,8 @@ const server = app.listen(PORT, () => {
   console.log(`[SERVER] POST /crawl - Start a new crawl`);
   console.log(`[SERVER] GET /crawl/:jobId - Get crawl job status`);
   console.log(`[SERVER] GET /crawl/:jobId/pages - Get crawled pages for a job`);
+  console.log(`[SERVER] POST /api/sitemaps/:sitemapId/extract-content - Start content extraction`);
+  console.log(`[SERVER] GET /api/sitemaps/:sitemapId/extract-content/:jobId - Get extraction job status`);
 });
 
 // Graceful shutdown handling

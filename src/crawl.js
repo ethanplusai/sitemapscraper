@@ -228,8 +228,19 @@ async function runCrawl(job) {
   }
 
   // Initialize BFS queue and data structures first
-  const queue = [{ url: seedUrl, depth: 0 }];
-  const seenUrls = new Set(); // URLs that have been enqueued (normalized)
+  // Queue must only contain normalized URLs
+  const seedNormalizedForQueue = normalizeUrl(seedUrl);
+  if (!seedNormalizedForQueue || !isPrimaryDomain(seedNormalizedForQueue, primaryDomain)) {
+    console.error(`[CRAWL FAILED] Job ${job.id} - Seed URL does not belong to primary domain: ${seedUrl}`);
+    await updateJobStatus(job.id, 'failed', {
+      error_message: `Seed URL does not belong to primary domain: ${seedUrl}`,
+      stop_reason: 'invalid_seed_url'
+    });
+    return;
+  }
+  
+  const queue = [{ normalized_url: seedNormalizedForQueue, depth: 0, original_url: seedUrl }];
+  const seenUrls = new Set(); // URLs that have been enqueued (normalized) - use normalized_url consistently
   const pagesMap = new Map(); // Map<normalized_url, Page> - primary deduplication store
   const originalUrlsMap = new Map(); // Maps normalized URL -> original URL (for CSV export)
   
@@ -337,64 +348,58 @@ async function runCrawl(job) {
     console.log(`[CRAWL START] Job ${job.id} - Found ${pagesMap.size} existing pages for this job (filtered to primary domain)`);
   }
 
-  // Normalize and add seed URL to seenUrls (it's been enqueued)
-  const seedNormalized = normalizeUrl(seedUrl);
-  if (seedNormalized && isPrimaryDomain(seedNormalized, primaryDomain)) {
-    seenUrls.add(seedNormalized);
-    // Store original seed URL (preserves www. if present)
-    originalUrlsMap.set(seedNormalized, seedUrl);
-  } else {
-    console.error(`[CRAWL FAILED] Job ${job.id} - Seed URL does not belong to primary domain: ${seedUrl}`);
-    await updateJobStatus(job.id, 'failed', {
-      error_message: `Seed URL does not belong to primary domain: ${seedUrl}`,
-      stop_reason: 'invalid_seed_url'
-    });
-    return;
-  }
+  // Add seed URL to seenUrls (it's been enqueued) - use normalized_url consistently
+  seenUrls.add(seedNormalizedForQueue);
+  // Store original seed URL (preserves www. if present)
+  originalUrlsMap.set(seedNormalizedForQueue, seedUrl);
   
   console.log(`[CRAWL START] Job ${job.id} - Primary domain: ${primaryDomain}`);
+  console.log(`[CRAWL START] Job ${job.id} - Seed normalized: ${seedNormalizedForQueue}`);
+  
+  // Fail-safe: Track iterations with no new pages added
+  let iterationsWithoutNewPages = 0;
+  const MAX_ITERATIONS_WITHOUT_NEW_PAGES = 5;
 
-  // BFS crawl loop
+  // BFS crawl loop - queue contains only normalized URLs
   while (queue.length > 0 && pagesCrawled < MAX_PAGES) {
-    const { url: currentUrl, depth } = queue.shift();
+    // TEMPORARY LOGGING: Queue size, visited count, pages count
+    console.log(`[QUEUE STATUS] Job ${job.id} - Queue: ${queue.length} | Visited: ${seenUrls.size} | Pages: ${pagesMap.size} | Crawled: ${pagesCrawled}`);
+    
+    const { normalized_url: normalizedUrl, depth, original_url: queueOriginalUrl } = queue.shift();
 
     // Skip if depth exceeds limit
     if (depth > MAX_DEPTH) {
-      console.log(`[SKIP] Job ${job.id} - ${absoluteUrl || currentUrl} - skipped due to depth (${depth} > ${MAX_DEPTH})`);
+      console.log(`[SKIP] Job ${job.id} - ${normalizedUrl} - skipped due to depth (${depth} > ${MAX_DEPTH})`);
       continue;
     }
 
-    // Resolve relative URLs to absolute
-    const absoluteUrl = resolveUrl(currentUrl, seedUrl);
+    // Queue already contains normalized URLs, so we can use it directly
+    // But we need the original URL for fetching - use stored original or reconstruct
+    let absoluteUrl = queueOriginalUrl;
     if (!absoluteUrl) {
-      console.log(`[SKIP] Job ${job.id} - Skipping invalid URL: ${currentUrl}`);
-      continue;
-    }
-
-    // Normalize the URL
-    const normalizedUrl = normalizeUrl(absoluteUrl);
-    if (!normalizedUrl) {
-      console.log(`[SKIP] Job ${job.id} - Skipping URL that failed normalization: ${absoluteUrl}`);
-      continue;
+      // Reconstruct from normalized URL (may lose query params, but that's ok for fetching)
+      // Try to get from originalUrlsMap first
+      absoluteUrl = originalUrlsMap.get(normalizedUrl) || normalizedUrl;
     }
 
     // PRIMARY DOMAIN ALLOWLIST: Only allow pages from primary domain (exact match, no subdomains)
+    // This should already be enforced when enqueueing, but double-check for safety
     if (!isPrimaryDomain(normalizedUrl, primaryDomain)) {
-      console.log(`[SKIP] Job ${job.id} - ${absoluteUrl} - skipped due to external domain (not primary domain: ${primaryDomain})`);
+      console.log(`[SKIP] Job ${job.id} - ${normalizedUrl} - skipped due to external domain (not primary domain: ${primaryDomain})`);
       continue; // Skip external URLs
     }
 
     // Skip if already crawled (Map-based deduplication)
     if (pagesMap.has(normalizedUrl)) {
-      console.log(`[SKIP] Job ${job.id} - ${absoluteUrl} - skipped due to duplicate normalized URL (already crawled): ${normalizedUrl}`);
+      console.log(`[SKIP] Job ${job.id} - ${normalizedUrl} - skipped due to duplicate normalized URL (already crawled)`);
       totalDuplicatesSkipped++;
       continue;
     }
 
-    // Check if URL should be skipped (protocol, extension, etc.)
+    // Check if URL should be skipped (protocol, extension, etc.) - check original URL
     const skipCheck = shouldSkipUrl(absoluteUrl);
     if (skipCheck.skip) {
-      console.log(`[SKIP] Job ${job.id} - ${absoluteUrl} - skipped due to ${skipCheck.reason}`);
+      console.log(`[SKIP] Job ${job.id} - ${normalizedUrl} - skipped due to ${skipCheck.reason}`);
       continue;
     }
 
@@ -410,9 +415,9 @@ async function runCrawl(job) {
     lastActivityTime = Date.now();
 
     try {
-      // Log progress with metrics
-      console.log(`[PROGRESS] Job ${job.id} - Crawling page ${pagesCrawled}/${MAX_PAGES} (depth ${depth}): ${absoluteUrl}`);
-      console.log(`[PROGRESS] Discovered: ${pagesMap.size} | Crawled: ${pagesCrawled} | Duplicates skipped: ${totalDuplicatesSkipped}`);
+      // Log progress with metrics - TEMPORARY LOGGING
+      console.log(`[PROGRESS] Job ${job.id} - Crawling page ${pagesCrawled}/${MAX_PAGES} (depth ${depth}): ${normalizedUrl}`);
+      console.log(`[PROGRESS] Discovered: ${pagesMap.size} | Crawled: ${pagesCrawled} | Duplicates skipped: ${totalDuplicatesSkipped} | Queue: ${queue.length}`);
       
       // Update job progress in database (non-blocking)
       updateJobStatus(job.id, 'running', {
@@ -573,6 +578,7 @@ async function runCrawl(job) {
         // Normalize and classify the link
         const { normalized: normalizedLink, isExternal } = normalizeAndClassifyUrl(link, fetchResult.url, primaryDomain);
         
+        // DO NOT enqueue external domains
         if (isExternal || !normalizedLink) {
           // External links already tracked above, skip enqueueing
           skippedCount++;
@@ -580,14 +586,15 @@ async function runCrawl(job) {
         }
 
         // PRIMARY DOMAIN ALLOWLIST: Only enqueue internal links from primary domain
+        // This check is critical - do NOT enqueue external domains
         if (!isPrimaryDomain(normalizedLink, primaryDomain)) {
           skippedCount++;
           continue;
         }
 
-        // Check if already seen (enqueued) or crawled - deduplication check
+        // DO NOT enqueue URLs already visited or already queued - use normalized_url consistently
         if (seenUrls.has(normalizedLink) || pagesMap.has(normalizedLink)) {
-          console.log(`[SKIP] Job ${job.id} - ${resolvedLink} - skipped due to duplicate normalized URL (already enqueued or crawled): ${normalizedLink}`);
+          console.log(`[SKIP] Job ${job.id} - ${normalizedLink} - skipped due to duplicate normalized URL (already enqueued or crawled)`);
           skippedCount++;
           duplicatesSkipped++;
           continue;
@@ -599,20 +606,35 @@ async function runCrawl(job) {
           continue;
         }
 
-        // Add to seenUrls immediately to prevent duplicate enqueueing
+        // Add to seenUrls immediately to prevent duplicate enqueueing - use normalized_url consistently
         seenUrls.add(normalizedLink);
         
-        // Store the resolved absolute URL in the queue
-        queue.push({ url: resolvedLink, depth: depth + 1 });
+        // Queue must only contain normalized URLs - store normalized_url, not resolvedLink
+        queue.push({ 
+          normalized_url: normalizedLink, 
+          depth: depth + 1,
+          original_url: resolvedLink // Store original for fetching
+        });
         enqueuedCount++;
         totalUrlsEnqueued++;
       }
 
+      // Fail-safe: Track if new pages were added
+      if (enqueuedCount === 0) {
+        iterationsWithoutNewPages++;
+        if (iterationsWithoutNewPages >= MAX_ITERATIONS_WITHOUT_NEW_PAGES && queue.length === 0) {
+          console.log(`[CRAWL COMPLETION] Job ${job.id} - No new pages added after ${iterationsWithoutNewPages} iterations, queue empty - terminating crawl`);
+          break; // Exit loop - queue will be empty
+        }
+      } else {
+        iterationsWithoutNewPages = 0; // Reset counter when new pages are added
+      }
+
       totalDuplicatesSkipped += duplicatesSkipped;
-      console.log(`[PROGRESS] Job ${job.id} - Enqueued ${enqueuedCount} new links, skipped ${skippedCount} links (${duplicatesSkipped} duplicates) from ${absoluteUrl}`);
+      console.log(`[PROGRESS] Job ${job.id} - Enqueued ${enqueuedCount} new links, skipped ${skippedCount} links (${duplicatesSkipped} duplicates) from ${normalizedUrl}`);
 
     } catch (error) {
-      console.error(`[ERROR] Job ${job.id} - Error processing ${absoluteUrl}:`, error.message);
+      console.error(`[ERROR] Job ${job.id} - Error processing ${normalizedUrl}:`, error.message);
       // Continue with next URL
       continue;
     }
@@ -621,6 +643,14 @@ async function runCrawl(job) {
   // Clear timeout and stall detection
   if (timeoutId) clearTimeout(timeoutId);
   if (stallCheckInterval) clearInterval(stallCheckInterval);
+  
+  // TEMPORARY LOGGING: Final queue status
+  console.log(`[CRAWL COMPLETION] Job ${job.id} - Final queue status: ${queue.length} remaining | Visited: ${seenUrls.size} | Pages: ${pagesMap.size}`);
+  
+  // Ensure loop terminated correctly
+  if (queue.length > 0 && pagesCrawled < MAX_PAGES) {
+    console.log(`[CRAWL COMPLETION] Job ${job.id} - Loop terminated but queue not empty - this should not happen`);
+  }
 
   // Update pages in database with final link metrics (incoming links are already calculated)
   console.log(`[CRAWL COMPLETION] Job ${job.id} - Updating link metrics in database...`);
@@ -664,7 +694,9 @@ async function runCrawl(job) {
   // Determine stop reason
   const stopReason = pagesCrawled >= MAX_PAGES 
     ? `MAX_PAGES limit reached (${MAX_PAGES})` 
-    : 'Queue exhausted';
+    : queue.length === 0
+    ? 'Queue exhausted'
+    : `No new pages added after ${iterationsWithoutNewPages} iterations`;
 
   console.log(`[CRAWL COMPLETION] Job ${job.id} - Crawl finished. Reason: ${stopReason}`);
   console.log(`[CRAWL COMPLETION] Job ${job.id} - Final stats: ${pagesCrawled} pages crawled, ${pagesMap.size} unique URLs discovered, ${totalDuplicatesSkipped} duplicates skipped`);
